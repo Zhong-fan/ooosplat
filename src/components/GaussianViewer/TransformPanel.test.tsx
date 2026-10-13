@@ -7,6 +7,7 @@ import { LanguageProvider } from "../../i18n";
 import type { GaussianCrop, GaussianTransform } from "../../types/pipeline";
 import { SelectionPanel } from "./SelectionPanel";
 import { TransformPanel } from "./TransformPanel";
+import { readGizmoMode, saveGizmoMode, type GizmoMode } from "./GizmoPreferences";
 
 function pointerEvent(type: string, x: number) {
   const event = new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x });
@@ -30,6 +31,38 @@ describe("TransformPanel", () => {
     await act(async () => root.unmount());
     container.remove();
     window.localStorage.clear();
+  });
+
+  it("uses two accessible toggles, can deselect either mode, and restores the persisted off state", async () => {
+    function Harness() {
+      const [mode, setMode] = useState<GizmoMode>(readGizmoMode);
+      return <LanguageProvider><TransformPanel transform={{ position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 }}
+        onBegin={() => {}} onChange={() => {}} onCommit={() => {}} gizmoMode={mode}
+        onGizmoModeChange={next => { setMode(next); saveGizmoMode(next); }} /></LanguageProvider>;
+    }
+    await act(async () => root.render(<Harness />));
+    const buttons = () => Array.from(container.querySelectorAll<HTMLButtonElement>(".transform-gizmo-control button"));
+    expect(buttons().map(button => button.textContent)).toEqual(["移动", "旋转"]);
+    expect(buttons().map(button => button.getAttribute("aria-pressed"))).toEqual(["true", "false"]);
+    expect(buttons()[0].title).toContain("再次点击");
+    await act(async () => { buttons()[0].focus(); buttons()[0].click(); });
+    expect(buttons().map(button => button.getAttribute("aria-pressed"))).toEqual(["false", "false"]);
+    expect(readGizmoMode()).toBe("off"); expect(document.activeElement).toBe(buttons()[0]);
+    await act(async () => buttons()[1].click());
+    expect(buttons().map(button => button.getAttribute("aria-pressed"))).toEqual(["false", "true"]);
+    await act(async () => buttons()[0].click());
+    expect(buttons().map(button => button.getAttribute("aria-pressed"))).toEqual(["true", "false"]);
+    await act(async () => buttons()[1].click());
+    await act(async () => buttons()[1].click());
+    await act(async () => root.unmount());
+    window.localStorage.setItem("ooo-splat-language", "en"); root = createRoot(container);
+    await act(async () => root.render(<Harness />));
+    expect(buttons().map(button => button.textContent)).toEqual(["Move", "Rotate"]);
+    expect(buttons().map(button => button.getAttribute("aria-pressed"))).toEqual(["false", "false"]);
+    expect(buttons()[1].title).toContain("enable");
+    await act(async () => buttons()[1].click());
+    expect(buttons()[1].getAttribute("aria-pressed")).toBe("true");
+    expect(buttons()[1].title).toContain("again");
   });
 
   it("scrubs a numeric value with a left-button horizontal drag", async () => {
@@ -61,6 +94,34 @@ describe("TransformPanel", () => {
     const uniform = Array.from(container.querySelectorAll<HTMLButtonElement>(".transform-scrubber")).find((button) => button.textContent === "Uniform");
     expect(uniform?.classList.contains("long-label")).toBe(true);
     expect(uniform?.closest(".transform-field")?.classList.contains("long-label")).toBe(true);
+  });
+
+  it("allows a uniform scale of 10000 and rejects values above it", async () => {
+    window.localStorage.setItem("ooo-splat-language", "en");
+    function Harness() {
+      const [transform, setTransform] = useState<GaussianTransform>({ position: [0, 0, 0], rotation: [0, 0, 0], scale: 1 });
+      return <LanguageProvider><TransformPanel transform={transform} onBegin={() => {}} onChange={setTransform} onCommit={() => {}} /></LanguageProvider>;
+    }
+    await act(async () => root.render(<Harness />));
+
+    const input = container.querySelector<HTMLInputElement>(".transform-panel section:last-of-type input")!;
+    await act(async () => { input.focus(); });
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "10000");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { input.blur(); });
+    expect(input.value).toBe("10000");
+    expect(input.getAttribute("aria-invalid")).toBe("false");
+
+    await act(async () => { input.focus(); });
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "10001");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => { input.blur(); });
+    expect(input.value).toBe("10000");
+    expect(input.getAttribute("aria-invalid")).toBe("true");
   });
 
   it("scrubs crop extents above 1000 without snapping to the transform scale limit", async () => {

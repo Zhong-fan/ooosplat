@@ -36,6 +36,14 @@ describe("interface language", () => {
       "FFprobe video analysis failed, exit code 1, executable engines/ffprobe.exe\nheader\nmoov atom not found",
     );
   });
+  it("localizes optional loop detection messages without relabeling exhaustive matching", () => {
+    expect(localizePipelineMessage("en", "COLMAP 正在进行 GPU 顺序匹配（已开启闭环检测）")).toBe("COLMAP is running sequential matching with GPU (loop detection enabled)");
+    expect(localizePipelineMessage("en", "顺序匹配（已开启闭环检测）完成")).toBe("Sequential matching (loop detection enabled) completed");
+    expect(localizePipelineMessage("en", "COLMAP 正在进行 CPU 穷举匹配")).toBe("COLMAP is running exhaustive matching with CPU");
+    expect(localizePipelineMessage("en", "闭环检测所需的辅助文件缺失或损坏。请重新安装 OOOSplat，或关闭自动优化后重试。\nSHA256 mismatch")).toContain("Reinstall OOOSplat, or turn off Auto Optimize");
+    expect(localizePipelineMessage("en", "外部进程执行失败：闭环检测所需的辅助文件缺失或损坏。请重新安装 OOOSplat，或关闭自动优化后重试。\nSHA256 mismatch")).toContain("Reinstall OOOSplat, or turn off Auto Optimize");
+    expect(localizePipelineMessage("zh-CN", "COLMAP 正在进行 GPU 顺序匹配（已开启闭环检测）")).toContain("已开启闭环检测");
+  });
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
 
@@ -74,16 +82,31 @@ describe("interface language", () => {
     expect(translate("en", "viewer.contextLost")).not.toContain("WebGL2");
   });
 
+  it("localizes image import and alpha preparation progress", () => {
+    expect(localizePipelineMessage("en", "正在导入图片 12/30 张")).toBe("Importing images 12/30");
+    expect(localizePipelineMessage("en", "正在导入补拍图片 3/8 张")).toBe("Importing reshoot images 3/8");
+    expect(localizePipelineMessage("en", "正在检测 Alpha 并生成 Mask 2/5 张")).toBe("Checking alpha and generating masks 2/5");
+    expect(localizePipelineMessage("en", "图片序列 30 张 · 1920×1080 · 检测到 Alpha 通道")).toBe("Image sequence 30 images · 1920×1080 · alpha channel detected");
+  });
+
+  it("localizes Brush device loss without exposing raw driver details", () => {
+    const message = "Splat 训练期间显卡设备连接中断。请接通电源、关闭占用显卡的软件，并在 Windows 图形设置中将 brush_app.exe 设为高性能后重试。\nParent device is lost";
+    expect(localizePipelineMessage("en", message)).toBe(
+      "The GPU device disconnected during Splat training. Connect the computer to power, close other GPU-heavy apps, set brush_app.exe to High performance in Windows Graphics settings, and try again.",
+    );
+    expect(localizePipelineMessage("zh-CN", message)).toBe(message);
+  });
+
   it("switches immediately, localizes formatting, and persists the explicit choice", async () => {
     window.localStorage.setItem("ooo-splat-language", "zh-CN");
     await act(async () => root.render(<LanguageProvider><Harness /></LanguageProvider>));
-    expect(container.textContent).toContain("01 创建新任务");
+    expect(container.textContent).toContain("创建新任务");
     expect(container.textContent).toContain("1 分 2 秒");
 
     const button = container.querySelector("button")!;
     await act(async () => button.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
-    expect(container.textContent).toContain("01 Create New Task");
+    expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("1m 2s");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
     expect(document.documentElement.lang).toBe("en");
