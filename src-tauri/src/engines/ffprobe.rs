@@ -6,16 +6,19 @@ use crate::{
     video::{parse_ffprobe_json, VideoInfo},
 };
 
-/// Preserve pre-project failures, including errors that occur before process startup.
-pub async fn probe_video_with_diagnostics(
+/// Attach best-effort diagnostics to a pre-project probe without hiding its cause.
+pub async fn with_probe_diagnostics<T>(
+    result: Result<T>,
     executable: &Path,
     input: &Path,
-    log_path: &Path,
-    process_manager: &ProcessManager,
-) -> Result<VideoInfo> {
-    match probe_video(executable, input, None, process_manager).await {
-        Ok(video) => Ok(video),
-        Err(error) => {
+    log_path: std::result::Result<std::path::PathBuf, String>,
+) -> Result<T> {
+    let error = match result {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    let detail = match log_path {
+        Ok(log_path) => {
             let diagnostic = format!(
                 "executable: {}\ninput: {}\n{error}\n",
                 executable.display(),
@@ -25,19 +28,20 @@ pub async fn probe_video_with_diagnostics(
                 if let Some(parent) = log_path.parent() {
                     tokio::fs::create_dir_all(parent).await?;
                 }
-                tokio::fs::write(log_path, diagnostic).await
+                tokio::fs::write(&log_path, diagnostic).await
             }
             .await;
-            let detail = match saved {
+            match saved {
                 Ok(()) => format!("Diagnostic log: {}", log_path.display()),
                 Err(log_error) => format!("Could not save diagnostic log: {log_error}"),
-            };
-            Err(SplatError::Diagnostic {
-                source: Box::new(error),
-                detail,
-            })
+            }
         }
-    }
+        Err(log_error) => format!("Could not save diagnostic log: {log_error}"),
+    };
+    Err(SplatError::Diagnostic {
+        source: Box::new(error),
+        detail,
+    })
 }
 
 pub async fn probe_video(
@@ -46,24 +50,47 @@ pub async fn probe_video(
     log_path: Option<std::path::PathBuf>,
     process_manager: &ProcessManager,
 ) -> Result<VideoInfo> {
+    Ok(
+        probe_video_metadata(executable, input, log_path, process_manager)
+            .await?
+            .0,
+    )
+}
+
+pub async fn probe_video_metadata(
+    executable: &Path,
+    input: &Path,
+    log_path: Option<std::path::PathBuf>,
+    process_manager: &ProcessManager,
+) -> Result<(VideoInfo, serde_json::Value)> {
     if !input.is_file() {
         return Err(SplatError::InvalidPath(input.to_path_buf()));
     }
-    let output = process_manager.run(ProcessSpec {
-        executable: executable.to_path_buf(),
-        args: vec![
-            OsString::from("-v"), OsString::from("error"),
-            OsString::from("-select_streams"), OsString::from("v:0"),
-            OsString::from("-show_entries"),
-            OsString::from("stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,codec_name,pix_fmt:stream_tags=rotate:stream_side_data=rotation:format=duration"),
-            OsString::from("-of"), OsString::from("json"),
-            input.as_os_str().to_owned(),
-        ],
-        working_directory: input.parent().map(Path::to_path_buf),
-        log_path,
-        observer: None,
-    }).await?;
-    parse_probe_output(executable, &output)
+    let output = process_manager
+        .clone()
+        .with_output_capture_limit(64 * 1024)
+        .run(ProcessSpec {
+            executable: executable.to_path_buf(),
+            args: vec![
+                OsString::from("-v"),
+                OsString::from("error"),
+                OsString::from("-select_streams"),
+                OsString::from("v:0"),
+                OsString::from("-show_streams"),
+                OsString::from("-show_format"),
+                OsString::from("-of"),
+                OsString::from("json"),
+                input.as_os_str().to_owned(),
+            ],
+            working_directory: input.parent().map(Path::to_path_buf),
+            log_path,
+            observer: None,
+        })
+        .await?;
+    Ok((
+        parse_probe_output(executable, &output)?,
+        serde_json::from_str(&output.stdout)?,
+    ))
 }
 
 fn parse_probe_output(executable: &Path, output: &ProcessOutput) -> Result<VideoInfo> {
@@ -96,6 +123,46 @@ fn parse_probe_output(executable: &Path, output: &ProcessOutput) -> Result<Video
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn probe_video_with_diagnostics(
+        executable: &Path,
+        input: &Path,
+        log_path: &Path,
+        manager: &ProcessManager,
+    ) -> Result<VideoInfo> {
+        let result = probe_video(executable, input, None, manager).await;
+        with_probe_diagnostics(result, executable, input, Ok(log_path.to_path_buf())).await
+    }
+
+    #[tokio::test]
+    async fn unavailable_log_directory_preserves_the_original_probe_error() {
+        let error = with_probe_diagnostics::<VideoInfo>(
+            Err(SplatError::EngineMissing("ffprobe.exe".into())),
+            Path::new("ffprobe.exe"),
+            Path::new("input.mp4"),
+            Err("Cannot resolve diagnostic log directory".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Cannot resolve diagnostic log directory"));
+        assert!(matches!(error, SplatError::Diagnostic { source, .. }
+            if matches!(*source, SplatError::EngineMissing(_))));
+    }
+
+    #[tokio::test]
+    async fn unavailable_log_directory_does_not_fail_a_successful_probe() {
+        let value = with_probe_diagnostics(
+            Ok(42),
+            Path::new("ffprobe.exe"),
+            Path::new("input.mp4"),
+            Err("Cannot resolve diagnostic log directory".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
+    }
 
     #[tokio::test]
     async fn preflight_logs_startup_failure_before_a_project_exists() {
@@ -147,6 +214,10 @@ mod tests {
             let output = ProcessOutput {
                 success: false,
                 exit_code,
+                termination: crate::process::ProcessTermination {
+                    exit_code,
+                    ..Default::default()
+                },
                 stdout: String::new(),
                 stderr: stderr.into(),
             };
@@ -168,6 +239,11 @@ mod tests {
         let output = ProcessOutput {
             success: false,
             exit_code: Some(0xC000_0135_u32 as i32),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0xC000_0135_u32 as i32),
+                windows_status: Some("0xC0000135".into()),
+                ..Default::default()
+            },
             stdout: String::new(),
             stderr: String::new(),
         };
@@ -181,6 +257,10 @@ mod tests {
         let output = ProcessOutput {
             success: true,
             exit_code: Some(0),
+            termination: crate::process::ProcessTermination {
+                exit_code: Some(0),
+                ..Default::default()
+            },
             stdout: r#"{"streams": [], "format": {"duration": "10"}}"#.into(),
             stderr: String::new(),
         };

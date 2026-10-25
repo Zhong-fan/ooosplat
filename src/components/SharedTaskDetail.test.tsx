@@ -32,6 +32,32 @@ beforeEach(() => {
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); window.localStorage.clear(); });
 
 describe('restored shared task detail', () => {
+  it('shows localized quiet notices as system logs without inventing counts', async () => {
+    localStorage.setItem('ooo-splat-language', 'en');
+    const notice = { kind: 'log', engine: 'system', stage: 'matching', sequence: 1,
+      message: '图像匹配进程仍在运行，最近 15 秒无新输出。此步骤可能耗时较长，请耐心等待' } as import('../types/pipeline').PipelineEvent;
+    await render(task({ stage: 'matching', current: null, total: null, recent_events: [notice] }));
+    expect(container.querySelector('.live-log')?.textContent).toContain('no new output for 15 seconds');
+    expect(container.querySelector('.live-log')?.textContent).toContain('system');
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).not.toBe('100.0%');
+  });
+  it('does not revive an old monitor or count after the task snapshot explicitly cleared them', async () => {
+    const old = { sequence: 1, timestamp: '2026-10-09T00:00:00Z', kind: 'progress', stage: 'trainingSplats', message: '', engine: 'system',
+      substage: 'panoramaTrainingPreparation', current: 72, total: 228, unit: 'panoramaFaces',
+      runtime: { training: { iteration: 999, total: 8000 } } } as unknown as import('../types/pipeline').PipelineEvent;
+    await render(task({ substage: 'training', current: null, total: null, progress: null, runtime: null,
+      operation: { id: 2, attempt: 2 }, recent_events: [old] }));
+    expect(container.querySelector('.current-message')?.textContent).not.toMatch(/72|228|999/);
+    expect(container.querySelector('.stage-timeline li.active b')?.textContent).toBe('Splat 训练');
+    expect(container.querySelector('.stage-timeline li.active small')?.textContent).toBe('处理中');
+    expect(container.textContent).toContain('本阶段第 2 次执行');
+  });
+  it('shows the saved projection in the readonly media box without re-detecting input', async () => {
+    mocks.detail.mockResolvedValue({ project, inputType: 'video', videoProjection: 'equirectangular', video: null, imageSequence: null });
+    await render(task({ project_id: project.id, status: 'cancelled' }));
+    expect(container.querySelector('.source-input-card .media-source-status')?.textContent).toContain('本任务按全景视频处理');
+    expect(container.querySelector('.source-input-card select')).toBeNull();
+  });
   it.each(['zh-CN', 'en'])('uses only preset progress captions for every stage in %s', async locale => {
     window.localStorage.setItem('ooo-splat-language', locale);
     const stages = [
@@ -71,6 +97,17 @@ describe('restored shared task detail', () => {
     expect(document.querySelector('.error-detail-tooltip')?.textContent).toBe(error.message);
   });
 
+  it('uses the new classification for the error summary but leaves legacy summaries alone', async () => {
+    const error = { code: 'pipeline_failed', message: 'wgpu error: Out of Memory\nIO error while loading dataset: early eof', failed_stage: 'trainingSplats', engine: 'brush', exit_code: 101, failure_id: null,
+      classification: 'brush_out_of_memory', classification_version: 1, classification_is_heuristic: false };
+    await render(task({ status: 'failed', error }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('训练显存不足');
+    expect(container.textContent).not.toContain('错误分类为启发式判断');
+    await render(task({ status: 'failed', error: { ...error, classification: 'brush_dataset', classification_version: undefined, classification_is_heuristic: true } }));
+    expect(container.querySelector('.inline-error .compact-error')?.textContent).toBe('生成所需图片读取不完整');
+    expect(container.textContent).toContain('错误分类为启发式判断');
+  });
+
   it('uses the original configuration, timeline and log layout with frozen settings and observed counters', async () => {
     await render(task({ input_path: '\\\\?\\E:\\Media\\orbit.mov', projects_root: '\\\\?\\E:\\Projects' }));
     expect(container.querySelectorAll('.path-picker.readonly')).toHaveLength(2);
@@ -103,7 +140,7 @@ describe('restored shared task detail', () => {
     await render(task({ status, stage: null, estimated_progress: null }));
     expect(button('继续生成')).toBeUndefined();
     expect(container.querySelector('.cancel-action')).toBeNull();
-    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('—');
+    expect(container.querySelector('.live-heading .mono')?.textContent).toBe('0.0%');
     expect(container.querySelectorAll('.stage-timeline .failed, .stage-timeline .cancelled, .stage-timeline .interrupted')).toHaveLength(0);
   });
 

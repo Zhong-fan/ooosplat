@@ -131,7 +131,10 @@ impl PipelineTelemetrySession {
             timing.active = Some((event.stage, now, record_effectiveness));
         }
 
-        if event
+        if !matches!(
+            event.substage.as_deref(),
+            Some("panoramaTrainingPreparation" | "panoramaTrainingValidation")
+        ) && event
             .stage_progress
             .is_some_and(|progress| progress >= 99.999)
         {
@@ -290,12 +293,35 @@ fn safe_error_code(error: &SplatError, stage: Option<TelemetryStage>) -> Telemet
         SplatError::Cancelled => TelemetryErrorCode::Unknown,
         SplatError::BrushOutOfMemory(_) => TelemetryErrorCode::BrushOutOfMemory,
         SplatError::BrushDeviceLost(_) => TelemetryErrorCode::BrushDeviceLost,
+        SplatError::EngineProcess(failure) => match failure.classification.kind {
+            Some("brush_out_of_memory") => TelemetryErrorCode::BrushOutOfMemory,
+            Some("brush_device_lost") => TelemetryErrorCode::BrushDeviceLost,
+            Some("mapper_storage")
+                if failure.detail.to_ascii_lowercase().contains("disk full")
+                    || failure
+                        .detail
+                        .to_ascii_lowercase()
+                        .contains("no space left") =>
+            {
+                TelemetryErrorCode::DiskSpaceLow
+            }
+            _ if failure.engine == crate::pipeline::PipelineEngine::Brush => {
+                TelemetryErrorCode::BrushFailed
+            }
+            _ if failure.engine == crate::pipeline::PipelineEngine::Colmap => {
+                match failure.operation.as_str() {
+                    "feature_extractor" => TelemetryErrorCode::ColmapFeatureFailed,
+                    "sequential_matcher" | "exhaustive_matcher" | "matches_importer" => {
+                        TelemetryErrorCode::ColmapMatchingFailed
+                    }
+                    _ => TelemetryErrorCode::ColmapMapperFailed,
+                }
+            }
+            _ => TelemetryErrorCode::Unknown,
+        },
         SplatError::Process(detail) => {
             let normalized = detail.to_ascii_lowercase();
-            if normalized.contains("out of memory")
-                || normalized.contains("outofmemory")
-                || detail.contains("显存不足")
-            {
+            if stage == Some(TelemetryStage::TrainingSplats) && crate::failure::gpu_oom(detail) {
                 return TelemetryErrorCode::BrushOutOfMemory;
             }
             if normalized.contains("no space")
@@ -329,8 +355,50 @@ mod tests {
     use super::*;
     use crate::pipeline::{EventLevel, PipelineEngine};
 
+    #[test]
+    fn engine_failure_telemetry_keeps_existing_codes_without_cross_engine_oom_guesses() {
+        for (engine, text, expected) in [
+            (
+                PipelineEngine::Brush,
+                "wgpu error: Out of Memory\nAn IO error happened",
+                TelemetryErrorCode::BrushOutOfMemory,
+            ),
+            (
+                PipelineEngine::Brush,
+                "BufferTooBig(2290420416)",
+                TelemetryErrorCode::BrushFailed,
+            ),
+            (
+                PipelineEngine::Brush,
+                "VK_ERROR_DEVICE_LOST",
+                TelemetryErrorCode::BrushDeviceLost,
+            ),
+            (
+                PipelineEngine::Colmap,
+                "wgpu error: Out of Memory",
+                TelemetryErrorCode::ColmapMapperFailed,
+            ),
+        ] {
+            let output = crate::process::ProcessOutput {
+                success: false,
+                exit_code: Some(101),
+                termination: Default::default(),
+                stdout: String::new(),
+                stderr: text.into(),
+            };
+            let failure =
+                crate::failure::EngineProcessFailure::from_output(engine, "mapper", &output);
+            let error = SplatError::EngineProcess(Box::new(failure));
+            assert_eq!(
+                safe_error_code(&error, Some(TelemetryStage::TrainingSplats)),
+                expected
+            );
+        }
+    }
+
     fn stage_event(stage: PipelineStage, stage_progress: f32) -> PipelineEvent {
         PipelineEvent {
+            operation: None,
             task_id: None,
             run_id: None,
             revision: 0,
@@ -340,6 +408,7 @@ mod tests {
             level: EventLevel::Info,
             stage,
             engine: Some(PipelineEngine::System),
+            substage: None,
             progress: stage_progress,
             stage_progress: Some(stage_progress),
             indeterminate: false,
@@ -369,6 +438,28 @@ mod tests {
             safe_error_code(&SplatError::Cancelled, None),
             TelemetryErrorCode::Unknown
         );
+    }
+
+    #[test]
+    fn panorama_preparation_does_not_complete_the_training_telemetry_stage() {
+        let directory = tempfile::tempdir().unwrap();
+        let (service, _) = TelemetryService::recording(directory.path().join("telemetry.json"));
+        let session =
+            PipelineTelemetrySession::new(service, Quality::Fast, TelemetryInputType::Video);
+        let mut event = stage_event(PipelineStage::TrainingSplats, 0.0);
+        event.substage = Some("panoramaTrainingPreparation".into());
+        session.observe(&event);
+        event.stage_progress = Some(100.0);
+        event.substage = Some("panoramaTrainingValidation".into());
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.substage = Some("training".into());
+        event.stage_progress = Some(0.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_some());
+        event.stage_progress = Some(100.0);
+        session.observe(&event);
+        assert!(session.timing.lock().unwrap().active.is_none());
     }
 
     #[test]

@@ -63,17 +63,16 @@ import {
   beginGaussianVideoExport,
   cancelGaussianVideoExport,
   commitGaussianVideoExport,
-  exportTransformedGaussian,
-  onGaussianExportProgress,
   revealFile,
+  readGaussianPreviewChunk,
 } from "../../lib/backend";
+import { ownedBinaryChunk } from "../../lib/binaryChunk";
 import { previewAssetUrl as withPreviewAssetRevision } from "../../lib/previewAssetUrl";
 import { getCurrentLocale, translate, useI18n, type TranslationKey } from "../../i18n";
 import { useGaussianTransformStore } from "../../stores/gaussianTransformStore";
 import type {
   GaussianCrop,
   GaussianEditorTool,
-  GaussianExportProgress,
   GaussianOrthographicView,
   GaussianTransform,
   GaussianVideoExportResult,
@@ -82,6 +81,7 @@ import type {
   GaussianHtmlExportResult,
   GaussianHtmlExportProgress,
   VideoOrientation,
+  TrainingReferenceView,
 } from "../../types/pipeline";
 import { PLY_TO_ENGINE_ROTATION } from "./CoordinateSystem";
 import {
@@ -92,6 +92,7 @@ import {
   type NormalizedCaptureRegion,
 } from "./PreviewCapture";
 import { configurePreviewRenderer, previewDeviceTypes } from "./PreviewBackend";
+import { PreviewRenderScheduler, requestPreviewRender } from "./PreviewRenderScheduler";
 import {
   GAUSSIAN_VIDEO_FRAME_COUNT,
   gaussianVideoDimensions,
@@ -125,6 +126,7 @@ import { EDITABLE_SPLAT_ASSET_OPTIONS, splatTextureCapacityError } from "./Splat
 import { createSplatRangeSource, shouldUseSplatRange } from "./SplatRangeSource";
 import { ViewerControls, type ViewerCameraState } from "./ViewerControls";
 import { readPreviewView, savePreviewView } from "./PreviewViewState";
+import { trainingReferenceInWorld } from "./TrainingReferenceView";
 import { invertSelectionShortcutLabel, isInvertSelectionShortcut } from "./SelectionShortcuts";
 import { InvertSelectionIcon } from "./InvertSelectionIcon";
 import { PreviewSortCoordinator } from "./PreviewSortCoordinator";
@@ -132,6 +134,9 @@ import { PreviewEditPersistence } from "./PreviewEditPersistence";
 import { ModelTransformGizmo } from "./ModelTransformGizmo";
 import { modelPivotFromPly, rotateAroundModelCenter, type ModelPivot } from "./ModelTransformMath";
 import { readGizmoMode, saveGizmoMode, type GizmoMode } from "./GizmoPreferences";
+import { PlyExportDialog, type PlyExportDialogState } from "./PlyExportDialog";
+import { createModelExport, type ModelExportOperation } from "../../lib/modelExport";
+import type { ModelFormat } from "../../lib/modelExportTypes";
 
 type ViewerMode = "adjust" | "preview";
 type ViewportPhase = "initializing" | "loading" | "mounting" | "ready" | "error";
@@ -154,6 +159,8 @@ interface SplatSceneApi {
   freezeCrop: (crop: Exclude<GaussianCrop, null>, deletedMask: Uint8Array) => Promise<Uint8Array>;
   deactivateCrop: () => void;
   alignView: (view: GaussianOrthographicView) => void;
+  locateView: () => void;
+  stopNavigation: () => void;
   initializeCrop: (kind: "sphere" | "box", previous: GaussianCrop) => Exclude<GaussianCrop, null> | null;
   snapshotView: () => GaussianHtmlView;
   saveView: () => boolean;
@@ -197,24 +204,12 @@ const PreviewCamera = memo(forwardRef<PcEntity>(function PreviewCamera(_props, r
   </Entity>;
 }));
 
-function nextAnimationFrame(signal: AbortSignal) {
-  return new Promise<void>((resolve, reject) => {
-    const abort = () => {
-      cancelAnimationFrame(frame);
-      reject(new DOMException(translate(getCurrentLocale(), "video.cancelled"), "AbortError"));
-    };
-    const frame = requestAnimationFrame(() => {
-      signal.removeEventListener("abort", abort);
-      resolve();
-    });
-    signal.addEventListener("abort", abort, { once: true });
-  });
-}
-
 interface SplatSceneProps {
   projectId: string;
   assetUrl: string;
   fileSize: number;
+  readToken?: string | null;
+  referenceView?: TrainingReferenceView | null;
   splatCount: number;
   transform: GaussianTransform;
   mode: ViewerMode;
@@ -226,12 +221,12 @@ interface SplatSceneProps {
   gizmoMode: GizmoMode;
   interactionBlocked: boolean;
   onGizmoDragging: (dragging: boolean, cancelled?: boolean) => void;
-  onOrthographicViewChange: (view: GaussianOrthographicView | null) => void;
+  onOrthographicViewChange: (view: GaussianOrthographicView | null, orthographic: boolean) => void;
   onStatus: (status: ViewportStatus) => void;
   onAnimationStatus: (status: AnimationStatus) => void;
 }
 
-const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ projectId, assetUrl, fileSize, transform, mode, tool, crop, deletedMask, selectionMask, editorMasksReady, gizmoMode, interactionBlocked, onGizmoDragging, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
+const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function LoadedSplatScene({ projectId, assetUrl, fileSize, readToken, referenceView, transform, mode, tool, crop, deletedMask, selectionMask, editorMasksReady, gizmoMode, interactionBlocked, onGizmoDragging, onOrthographicViewChange, onStatus, onAnimationStatus }, ref) {
   const { t } = useI18n();
   const app = useApp();
   const cameraRef = useRef<PcEntity>(null);
@@ -244,6 +239,12 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   const orbitAxisGuideRef = useRef<OrbitAxisGuide | null>(null);
   const selectionRef = useRef<GaussianSelectionController | null>(null);
   const sortCoordinatorRef = useRef<PreviewSortCoordinator | null>(null);
+  const renderSchedulerRef = useRef<PreviewRenderScheduler | null>(null);
+  useEffect(() => {
+    const scheduler = new PreviewRenderScheduler(app);
+    renderSchedulerRef.current = scheduler;
+    return () => { scheduler.destroy(); if (renderSchedulerRef.current === scheduler) renderSchedulerRef.current = null; };
+  }, [app]);
   const appDestroyedRef = useRef(false);
   const contextLostRef = useRef(false);
   const modeRef = useRef<ViewerMode>(mode);
@@ -259,6 +260,8 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   gizmoStateRef.current = { mode, tool, gizmoMode, interactionBlocked };
   const configureGizmo = useCallback(() => {
     const state = gizmoStateRef.current;
+    controlsRef.current?.setRoamingEnabled(sceneReadyRef.current && !appDestroyedRef.current
+      && !contextLostRef.current && !exportingRef.current && !state.interactionBlocked && state.mode === "adjust");
     gizmoRef.current?.configure(state.gizmoMode, sceneReadyRef.current && !appDestroyedRef.current
       && !contextLostRef.current && !exportingRef.current && !state.interactionBlocked
       && state.mode === "adjust" && state.tool === "transform");
@@ -270,14 +273,22 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   configurePreviewRenderer(app);
   app.scene.gsplat.colorUpdateAngle = 0;
   useEffect(() => {
-    const coordinator = new PreviewSortCoordinator(app);
+    const coordinator = new PreviewSortCoordinator(app, () => renderSchedulerRef.current!.forceFrames());
     sortCoordinatorRef.current = coordinator;
     return () => { coordinator.destroy(); if (sortCoordinatorRef.current === coordinator) sortCoordinatorRef.current = null; };
   }, [app]);
-  const rangeSource = useMemo(
-    () => shouldUseSplatRange(fileSize) ? createSplatRangeSource(assetUrl, fileSize) : null,
-    [assetUrl, fileSize],
-  );
+  const rangeSource = useMemo(() => {
+    if (!readToken && !shouldUseSplatRange(fileSize)) return null;
+    const readRange: typeof fetch | undefined = readToken ? async (_input, init) => {
+      const match = /^bytes=(\d+)-(\d+)$/.exec(new Headers(init?.headers).get("Range") ?? "");
+      if (!match) return new Response(null, { status: 416 });
+      const start = Number(match[1]);
+      const end = Number(match[2]);
+      const body = ownedBinaryChunk(await readGaussianPreviewChunk(readToken, start, end - start + 1));
+      return new Response(body.buffer, { status: 206, headers: { "Content-Range": `bytes ${start}-${start + body.byteLength - 1}/${fileSize}` } });
+    } : undefined;
+    return createSplatRangeSource(assetUrl, fileSize, readRange);
+  }, [assetUrl, fileSize, readToken]);
   const splatAssetOptions = useMemo(() => rangeSource ? {
     data: EDITABLE_SPLAT_ASSET_OPTIONS.data,
     file: {
@@ -316,7 +327,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       component.setParameter("uOoosplatAnimationTime", Math.min(elapsedSeconds, ORBIT_START_SECONDS));
     }
     animationEffectActiveRef.current = effectActive;
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   const reportAnimation = useCallback((elapsedSeconds: number, force = false) => {
@@ -342,6 +353,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     } else {
       setAnimationUniforms(false, animationElapsedRef.current);
     }
+    renderSchedulerRef.current?.setAnimating(mode === "preview" && sceneReadyRef.current && !exportingRef.current);
   }, [mode, replay, setAnimationUniforms, tool]);
 
   useEffect(() => {
@@ -372,12 +384,13 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     const reportDeviceLost = () => {
       if (contextLostRef.current || appDestroyedRef.current) return;
       contextLostRef.current = true;
+      renderSchedulerRef.current?.destroy();
       sceneReadyRef.current = false;
       gizmoRef.current?.destroy(true);
       gizmoRef.current = null;
       sortCoordinatorRef.current?.destroy();
       if (controlsRef.current) controlsRef.current.enabled = false;
-      onOrthographicViewChange(null);
+      onOrthographicViewChange(null, false);
       onStatus({
         phase: "error",
         progress: 0,
@@ -409,14 +422,14 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     component.setParameter("uOoosplatCropInverted", currentCrop?.inverted ? 1 : 0);
     component.setParameter("uOoosplatShowSelection", currentMode === "adjust" && currentTool === "rectangle" ? 1 : 0);
     if (!animationEffectActiveRef.current) component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   useEffect(() => { applyEditorUniforms(); }, [applyEditorUniforms, crop, mode, tool]);
   useEffect(() => {
     cropOutlineRef.current?.setCrop(crop);
     cropOutlineRef.current?.setVisible(mode === "adjust" && (tool === "sphere" || tool === "box") && crop !== null);
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app, crop, mode, tool]);
   useEffect(() => {
     void selectionRef.current?.applyMasks(deletedMask, selectionMask);
@@ -428,6 +441,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       if (appDestroyedRef.current || contextLostRef.current || exportingRef.current) return;
       app.graphicsDevice.maxPixelRatio = Math.max(1, window.devicePixelRatio || 1);
       app.resizeCanvas(Math.max(1, container.clientWidth), Math.max(1, container.clientHeight));
+      requestPreviewRender(app);
     };
     const observer = new ResizeObserver(resize);
     observer.observe(container);
@@ -593,7 +607,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     const persistView = () => {
       if (ready && !exportingRef.current && !contextLostRef.current) savePreviewView(projectId, controls.snapshot());
     };
-    const controls = new ViewerControls(app.graphicsDevice.canvas, cameraRef.current, onOrthographicViewChange, t("viewer.cameraUnavailable"), persistView);
+    const controls = new ViewerControls(app.graphicsDevice.canvas, cameraRef.current, onOrthographicViewChange, t("viewer.cameraUnavailable"), persistView, () => { requestPreviewRender(app); });
     controls.enabled = false;
     persistViewRef.current = persistView;
     window.addEventListener("pagehide", persistView);
@@ -605,9 +619,19 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       component,
       cameraRef.current.camera!,
       source.numSplats,
-      () => { app.renderNextFrame = true; },
+      () => { requestPreviewRender(app); },
     );
     selectionRef.current = selection;
+    // Update camera/uniforms before auxiliary prerender listeners capture lines.
+    const updateHandle = app.on("prerender", () => {
+      if (!ready || exportingRef.current || modeRef.current !== "preview") return;
+      const previous = animationElapsedRef.current;
+      const elapsed = previous + (renderSchedulerRef.current?.animationDelta() ?? 0);
+      animationElapsedRef.current = elapsed;
+      setAnimationUniforms(true, elapsed);
+      controls.orbitBy((elapsed - previous) * ORBIT_DEGREES_PER_SECOND);
+      reportAnimation(elapsed);
+    });
     const gridBounds = new BoundingBox();
     gridBounds.setFromTransformedAabb(source.aabb, splatRef.current.getWorldTransform());
     const grid = new GroundGrid(app, gridBounds);
@@ -656,16 +680,6 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     applyEditorUniforms();
     setAnimationUniforms(modeRef.current === "preview", animationElapsedRef.current);
 
-    const updateHandle = app.on("update", (deltaSeconds: number) => {
-      if (!ready || exportingRef.current || modeRef.current !== "preview") return;
-      const previous = animationElapsedRef.current;
-      const elapsed = previous + Math.min(Math.max(deltaSeconds, 0), 0.1);
-      animationElapsedRef.current = elapsed;
-      setAnimationUniforms(true, elapsed);
-      controls.orbitBy((elapsed - previous) * ORBIT_DEGREES_PER_SECOND);
-      reportAnimation(elapsed);
-    });
-
     const initialization = new AbortController();
     void (async () => {
       await selection.applyMasks(editorStateRef.current.deletedMask, editorStateRef.current.selectionMask);
@@ -678,6 +692,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       initialization.signal.throwIfAborted();
       ready = true;
       sceneReadyRef.current = true;
+      renderSchedulerRef.current?.setAnimating(modeRef.current === "preview");
       controls.enabled = true;
       configureGizmo();
       if (modeRef.current === "preview") replay();
@@ -691,6 +706,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     return () => {
       initialization.abort();
       sceneReadyRef.current = false;
+      renderSchedulerRef.current?.setAnimating(false);
       gizmo.destroy();
       if (gizmoRef.current === gizmo) gizmoRef.current = null;
       updateHandle.off();
@@ -784,6 +800,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     });
 
     exportingRef.current = true;
+    renderSchedulerRef.current?.setAnimating(false);
     configureGizmo();
     controls.enabled = false;
     gridRef.current?.setVisible(false);
@@ -804,11 +821,12 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
           signal.throwIfAborted();
           animationElapsedRef.current = timeSeconds;
           setAnimationUniforms(true, timeSeconds);
-          controls.restore(cameraState);
+          controls.restore({ ...cameraState, fov: verticalFovForCapture(previousFov, captureRegion.height),
+            projectionOffset: cameraState.projectionOffset?.map(value => value / captureRegion.height) as [number, number] | undefined });
           cameraEntity.camera!.orthoHeight = previousOrthoHeight * captureRegion.height;
           controls.setOrbitYaw(cameraState.yaw + orbitDegreesAt(timeSeconds));
           await sortCoordinatorRef.current!.waitForFrame(cameraEntity.camera!, signal, t("video.sortTimeout"));
-          await nextAnimationFrame(signal);
+          signal.throwIfAborted();
           app.render();
           const pixels = await videoTexture.read(
             0,
@@ -831,6 +849,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       });
     } finally {
       exportingRef.current = false;
+      renderSchedulerRef.current?.setAnimating(modeRef.current === "preview");
       configureGizmo();
       animationElapsedRef.current = elapsed;
       cameraEntity.camera.renderTarget = previousRenderTarget;
@@ -844,7 +863,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
       videoRenderTarget.destroy();
       setAnimationUniforms(modeRef.current === "preview", elapsed);
       reportAnimation(elapsed, true);
-      app.renderNextFrame = true;
+      requestPreviewRender(app);
     }
   }, [app, configureGizmo, reportAnimation, setAnimationUniforms]);
 
@@ -882,7 +901,7 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     component.workBufferUpdate = WORKBUFFER_UPDATE_ONCE;
     cropOutlineRef.current?.setCrop(null);
     cropOutlineRef.current?.setVisible(false);
-    app.renderNextFrame = true;
+    requestPreviewRender(app);
   }, [app]);
 
   const cropBounds = useCallback(() => {
@@ -898,6 +917,16 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
     const bounds = cropBounds();
     if (bounds) controlsRef.current?.alignOrthographic(view, bounds, FIT_OCCUPANCY);
   }, [cropBounds]);
+
+  const locateView = useCallback(() => {
+    // Reuse robust bounds for the orbit distance, without changing the actual
+    // training camera pose or rescanning the model when Locate is clicked.
+    const bounds = transformedEffectBounds();
+    if (!referenceView || !bounds || !sceneReadyRef.current || gizmoStateRef.current.interactionBlocked) return;
+    const current = useGaussianTransformStore.getState();
+    controlsRef.current?.locate(trainingReferenceInWorld(referenceView, current.transform), bounds);
+    requestPreviewRender(app);
+  }, [app, referenceView, transformedEffectBounds]);
 
   const initializeCrop = useCallback((kind: "sphere" | "box", previous: GaussianCrop) => {
     if (previous?.kind === kind) return previous;
@@ -927,7 +956,8 @@ const LoadedSplatScene = forwardRef<SplatSceneApi, SplatSceneProps>(function Loa
   }, [projectId]);
   const modelPivot = useCallback(() => robustLocalBoundsRef.current ? modelPivotFromPly(robustLocalBoundsRef.current.center) : null, []);
   const finishGizmo = useCallback((cancel = false) => gizmoRef.current?.finish(cancel), []);
-  useImperativeHandle(ref, () => ({ replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, initializeCrop }), [alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, modelPivot, replay, saveView, selectRectangle, snapshotView]);
+  const stopNavigation = useCallback(() => controlsRef.current?.stopNavigation(), []);
+  useImperativeHandle(ref, () => ({ replay, exportVideo, snapshotView, saveView, modelPivot, finishGizmo, selectRectangle, invertSelection, freezeCrop, deactivateCrop, alignView, locateView, stopNavigation, initializeCrop }), [alignView, deactivateCrop, exportVideo, finishGizmo, freezeCrop, initializeCrop, invertSelection, locateView, modelPivot, replay, saveView, selectRectangle, snapshotView, stopNavigation]);
 
   return <>
     <PreviewCamera ref={cameraRef} />
@@ -995,15 +1025,21 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>(readGizmoMode);
   const [gizmoDragging, setGizmoDragging] = useState(false);
   const [orthographicView, setOrthographicView] = useState<GaussianOrthographicView | null>(null);
+  const [orthographicProjection, setOrthographicProjection] = useState(false);
+  const onViewDirectionChange = useCallback((view: GaussianOrthographicView | null, orthographic: boolean) => {
+    setOrthographicView(view); setOrthographicProjection(orthographic);
+  }, []);
   const [selectionDrag, setSelectionDrag] = useState<null | { pointerId: number; startX: number; startY: number; x: number; y: number; selectionMode: RectangleSelectionMode }>(null);
   const [viewport, setViewport] = useState<ViewportStatus>(INITIAL_VIEWPORT);
   const [rendererRevision, setRendererRevision] = useState(0);
   const [loadedMaskKey, setLoadedMaskKey] = useState<string | null>(null);
   const [savingEdits, setSavingEdits] = useState(false);
   const [saveNotice, setSaveNotice] = useState<"saved" | "viewFailed" | null>(null);
-  const [gaussianExportError, setGaussianExportError] = useState<string | null>(null);
-  const [gaussianExporting, setGaussianExporting] = useState(false);
-  const [gaussianExportProgress, setGaussianExportProgress] = useState(0);
+  const [gaussianExportDialog, setGaussianExportDialog] = useState<PlyExportDialogState>({ phase: "closed" });
+  const [gaussianExportProgress, setGaussianExportProgress] = useState<number | null>(0);
+  const [modelFormat, setModelFormat] = useState<ModelFormat>("ply");
+  const modelOperationRef = useRef<ModelExportOperation | null>(null);
+  const modelAttemptRef = useRef(0);
   const [gaussianExportResult, setGaussianExportResult] = useState<string | null>(null);
   const [animationStatus, setAnimationStatus] = useState<AnimationStatus>({ phase: "reveal", elapsedSeconds: 0 });
   const [videoCapability, setVideoCapability] = useState(INITIAL_VIDEO_CAPABILITY);
@@ -1034,6 +1070,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
 
   const onStatus = useCallback((status: ViewportStatus) => setViewport(status), []);
   const onAnimationStatus = useCallback((status: AnimationStatus) => setAnimationStatus(status), []);
+  const gaussianExporting = !["closed", "completed", "error"].includes(gaussianExportDialog.phase);
   const operationBusy = savingEdits || navigationSaving || pendingNavigation !== null || htmlBusy || htmlConfirm || cropFreezing || gaussianExporting || !["idle", "completed", "error"].includes(videoPhase);
   const busy = operationBusy || gizmoDragging;
   const interactionBlocked = operationBusy || viewport.phase !== "ready" || cropFreezeError !== null;
@@ -1048,9 +1085,15 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     const persistence = new PreviewEditPersistence(projectId);
     persistenceRef.current = persistence;
     setGaussianExportResult(null);
+    setGaussianExportDialog({ phase: "closed" });
     setPendingNavigation(null);
     setSaveNotice(null);
-    return () => { persistence.destroy(); if (persistenceRef.current === persistence) persistenceRef.current = null; };
+    return () => {
+      modelAttemptRef.current += 1;
+      void modelOperationRef.current?.cancel().catch(() => undefined);
+      modelOperationRef.current = null;
+      persistence.destroy(); if (persistenceRef.current === persistence) persistenceRef.current = null;
+    };
   }, [store.descriptor?.projectId]);
   useEffect(() => { setSaveNotice(null); }, [store.revision]);
 
@@ -1133,16 +1176,6 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     return () => window.clearTimeout(timeout);
   }, [rendererRevision, store.descriptor?.projectId]);
 
-  useEffect(() => {
-    let unlisten: undefined | (() => void);
-    void onGaussianExportProgress((event: GaussianExportProgress) => {
-      if (event.projectId === useGaussianTransformStore.getState().descriptor?.projectId) {
-        setGaussianExportProgress(event.progress);
-      }
-    }).then((fn) => { unlisten = fn; });
-    return () => unlisten?.();
-  }, []);
-
   useEffect(() => () => {
     videoAbortRef.current?.abort();
     const session = videoSessionRef.current;
@@ -1159,7 +1192,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     };
   }, [onDisposed, previewSessionId, store.descriptor?.projectId]);
 
-  const flushEdits = async (retry = false) => {
+  const flushEdits = async (retry = false, notify = true) => {
     sceneApiRef.current?.finishGizmo();
     const projectId = useGaussianTransformStore.getState().descriptor?.projectId;
     if (document.activeElement instanceof HTMLInputElement) document.activeElement.blur();
@@ -1170,7 +1203,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     await persistenceRef.current.flush(retry);
     if (useGaussianTransformStore.getState().descriptor?.projectId !== projectId) throw new Error(t("viewer.editsUnsaved"));
     const viewSaved = sceneApiRef.current?.saveView() ?? false;
-    setSaveNotice(viewSaved ? "saved" : "viewFailed");
+    if (notify) setSaveNotice(viewSaved ? "saved" : "viewFailed");
   };
   const saveEdits = async (retry = false) => {
     if (busy || exportBusyRef.current || viewport.phase !== "ready") return;
@@ -1180,24 +1213,62 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
     catch (error) { useGaussianTransformStore.getState().setSaveState("error", error instanceof Error ? error.message : String(error)); }
     finally { exportBusyRef.current = false; setSavingEdits(false); }
   };
-  const exportGaussian = async () => {
-    if (!store.descriptor || busy || exportBusyRef.current) return;
+  const exportGaussian = async (format: ModelFormat, retry = false) => {
+    if (!store.descriptor || busy || exportBusyRef.current || (retry && gaussianExportDialog.phase !== "error")) return;
     exportBusyRef.current = true;
-    setGaussianExporting(true);
+    setGaussianExportDialog({ phase: "preparing" });
     setGaussianExportProgress(0);
     setGaussianExportResult(null);
-    setGaussianExportError(null);
+    setSaveNotice(null);
+    const attempt = ++modelAttemptRef.current;
+    setModelFormat(format);
     try {
-      await flushEdits();
+      await flushEdits(retry, false);
+      if (attempt !== modelAttemptRef.current) return;
       const current = useGaussianTransformStore.getState();
-      const result = await exportTransformedGaussian(store.descriptor.projectId, current.transform, current.editing.revision);
-      setGaussianExportProgress(100);
+      const operation = createModelExport(store.descriptor.projectId, current.transform, current.editing.revision, format, (event) => {
+        if (attempt !== modelAttemptRef.current) return;
+        setGaussianExportProgress(event.progress);
+        setGaussianExportDialog(event.phase === "awaitingConfirmation"
+          ? { phase: event.phase, exportId: event.exportId, confirmationId: event.confirmationId, adjustment: event.adjustment }
+          : { phase: event.phase });
+      });
+      modelOperationRef.current = operation;
+      const result = await operation.export();
+      if (attempt !== modelAttemptRef.current) return;
       setGaussianExportResult(result.path);
+      setGaussianExportDialog({ phase: "completed", path: result.path, fileSize: result.fileSize, coordinateAdjustment: result.coordinateAdjustment });
     } catch (error) {
-      setGaussianExportError(error instanceof Error ? error.message : String(error));
+      if (attempt === modelAttemptRef.current) {
+        modelOperationRef.current = null; exportBusyRef.current = false;
+        setGaussianExportDialog({ phase: "error", error: error instanceof Error ? error.message : String(error) });
+      }
     } finally {
-      exportBusyRef.current = false;
-      setGaussianExporting(false);
+      if (attempt === modelAttemptRef.current) { modelOperationRef.current = null; exportBusyRef.current = false; }
+    }
+  };
+  const cancelModelExport = async () => {
+    const operation = modelOperationRef.current;
+    const attempt = ++modelAttemptRef.current;
+    setGaussianExportDialog({ phase: "cancelling" });
+    try { await operation?.cancel(); if (attempt === modelAttemptRef.current) setGaussianExportDialog({ phase: "closed" }); }
+    catch (error) { if (attempt === modelAttemptRef.current) setGaussianExportDialog({ phase: "error", error: String(error) }); }
+    finally { if (attempt === modelAttemptRef.current) { modelOperationRef.current = null; exportBusyRef.current = false; } }
+  };
+  const closeGaussianExportDialog = () => {
+    if (!gaussianExporting) setGaussianExportDialog({ phase: "closed" });
+  };
+  const revealGaussianExport = async (path: string, keepDialogOpen = true) => {
+    try {
+      await revealFile(path);
+      if (keepDialogOpen) setGaussianExportDialog(previous => ({ ...previous, phase: "completed", path, revealError: undefined }));
+    } catch (error) {
+      setGaussianExportDialog(previous => ({
+        ...previous,
+        phase: "completed",
+        path,
+        revealError: error instanceof Error ? error.message : String(error),
+      }));
     }
   };
 
@@ -1471,6 +1542,7 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
   const rectanglePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (mode !== "adjust" || store.tool !== "rectangle" || event.button !== 0 || busy || viewport.phase !== "ready") return;
     if ((event.target as Element).closest("button,input,aside")) return;
+    sceneApiRef.current?.stopNavigation();
     event.preventDefault(); event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     setSelectionDrag({ pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: event.clientX, y: event.clientY, selectionMode: event.ctrlKey ? "remove" : event.shiftKey ? "add" : "replace" });
@@ -1558,9 +1630,12 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         <p>{mode === "adjust" ? t("viewer.adjustHint") : t("viewer.animationHint")}</p>
       </div>
       <div className="preview-input-hints" aria-label={t("viewer.inputAria")}>
-        <span><Orbit size={15} /><kbd>{mode === "adjust" && store.tool === "rectangle" ? t("viewer.middle") : t("viewer.left")}</kbd>{mode === "adjust" && store.tool === "transform" && gizmoMode !== "off" ? t("viewer.orbitBlank") : t("viewer.rotate")}</span>
+        <span><Orbit size={15} /><kbd>{mode === "adjust" && store.tool === "rectangle" ? t("viewer.middle") : t("viewer.left")}</kbd>{t("viewer.rotate")}</span>
         <span><Move size={15} /><kbd>{t("viewer.right")}</kbd>{t("viewer.drag")}</span>
         <span><ZoomIn size={15} /><kbd>{t("viewer.wheel")}</kbd>{t("viewer.zoom")}</span>
+        {mode === "adjust" && <span className={`preview-roam-hint${orthographicProjection ? " unavailable" : ""}`} title={t("viewer.roamHint")} aria-disabled={orthographicProjection}>
+          <Move size={15} /><kbd>WASD</kbd>{t("viewer.roam")}
+        </span>}
         {mode === "adjust" && store.tool === "transform" && gizmoMode !== "off" && <>
           <span><Move size={15} /><kbd>{t("viewer.left")}</kbd>{t(gizmoMode === "translate" ? "viewer.gizmoMove" : "viewer.gizmoRotate")}</span>
           <span><X size={15} /><kbd>Esc</kbd>{t("viewer.cancelTransform")}</span>
@@ -1585,6 +1660,9 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         {mode === "preview" && <PreviewOrientationControl orientation={orientation} disabled={busy} onChange={setOrientation} />}
         {mode === "adjust" && <div className="preview-view-control" role="group" aria-label={t("viewer.viewsAria")}>
           {(["side", "front", "top"] as const).map((view) => { const viewLabel = view === "side" ? t("viewer.side") : view === "front" ? t("viewer.front") : t("viewer.top"); return <button key={view} type="button" className={orthographicView === view ? "active" : ""} aria-pressed={orthographicView === view} disabled={busy || viewport.phase !== "ready"} title={t("viewer.switchView", { view: viewLabel })} onClick={() => alignView(view)}>{viewLabel}</button>; })}
+          <button type="button" disabled={busy || viewport.phase !== "ready" || !store.descriptor.referenceView}
+            title={t(!store.descriptor.referenceView ? store.descriptor.referenceViewUnavailable === "imported" ? "viewer.locateImported" : "viewer.locateUnavailable" : "viewer.locateHint")}
+            onClick={() => sceneApiRef.current?.locateView()}>{t("viewer.locate")}</button>
         </div>}
       </div>
       <div className="preview-header-actions">
@@ -1599,14 +1677,14 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
         </>}
         {videoBusy ? <button type="button" className="video-cancel" onClick={cancelVideo}><X size={14} />{t("viewer.cancelExport")}</button>
           : htmlBusy ? <button type="button" className="video-cancel" onClick={cancelHtml}><X size={14} />{t("viewer.cancelExport")}</button>
-          : <PreviewExportMenu mode={mode} disabled={busy || viewport.phase !== "ready"} videoSupported={videoCapability.supported} videoReason={videoCapability.reason} onPly={() => void exportGaussian()} onVideo={() => void exportVideo()} onHtml={() => setHtmlConfirm(true)} />}
+          : <PreviewExportMenu mode={mode} disabled={busy || viewport.phase !== "ready"} videoSupported={videoCapability.supported} videoReason={videoCapability.reason} onModel={format => void exportGaussian(format)} onVideo={() => void exportVideo()} onHtml={() => setHtmlConfirm(true)} />}
       </div>
     </div>
     {pipelineRunning && <div className="preview-resource-note">{t("viewer.resourceNote")}</div>}
     <div className="preview-editor">
       <div ref={viewportElementRef} inert={operationBusy} className={`gaussian-viewport tool-${store.tool}`} onPointerDownCapture={rectanglePointerDown} onPointerMoveCapture={rectanglePointerMove} onPointerUpCapture={rectanglePointerEnd} onPointerCancelCapture={rectanglePointerEnd}>
-        <Application key={`${store.descriptor.projectId}-${rendererRevision}`} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
-          <SplatScene ref={sceneApiRef} projectId={store.descriptor.projectId} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} editorMasksReady={!store.descriptor.editMaskAssetUrl || loadedMaskKey === `${store.descriptor.projectId}:${store.descriptor.editMaskAssetUrl}`} gizmoMode={gizmoMode} interactionBlocked={interactionBlocked} onGizmoDragging={onGizmoDragging} onOrthographicViewChange={setOrthographicView} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
+        <Application key={`${store.descriptor.projectId}-${rendererRevision}`} autoRender={false} className="gaussian-canvas" deviceTypes={previewDeviceTypes()} graphicsDeviceOptions={{ antialias: false, alpha: false, preserveDrawingBuffer: true, powerPreference: "high-performance" }}>
+          <SplatScene ref={sceneApiRef} projectId={store.descriptor.projectId} assetUrl={previewAssetUrl} fileSize={store.descriptor.fileSize} readToken={store.descriptor.readToken} referenceView={store.descriptor.referenceView} splatCount={store.descriptor.splatCount} transform={store.transform} mode={mode} tool={store.tool} crop={store.editing.crop} deletedMask={store.deletedMask} selectionMask={store.selectionMask} editorMasksReady={!store.descriptor.editMaskAssetUrl || loadedMaskKey === `${store.descriptor.projectId}:${store.descriptor.editMaskAssetUrl}`} gizmoMode={gizmoMode} interactionBlocked={interactionBlocked || selectionDrag !== null} onGizmoDragging={onGizmoDragging} onOrthographicViewChange={onViewDirectionChange} onStatus={onStatus} onAnimationStatus={onAnimationStatus} />
         </Application>
         {mode === "preview" && <div ref={captureGuideRef} className={`portrait-capture-guide orientation-${orientation}`} style={guideSize} aria-hidden="true">
           <div className="portrait-frame-label"><span>{gaussianVideoDimensions(orientation).width} × {gaussianVideoDimensions(orientation).height}</span><span>30 FPS</span></div>
@@ -1644,19 +1722,27 @@ export function GaussianViewer({ previewSessionId, onExit, onDisposed, pipelineR
       <span><b>{t("viewer.renderer")}</b>{viewport.renderer}</span>
       <span><b>{t("viewer.status")}</b>{phaseLabel}</span>
       {mode === "adjust" && <span className={`save-state ${store.saveState}`}><b>{t("viewer.project")}</b>{store.saveState === "saving" ? t("viewer.stateSaving") : store.saveState === "error" ? t("viewer.stateFailed") : store.saveState === "dirty" ? t("viewer.stateDirty") : t("viewer.stateSaved")}</span>}
-      {gaussianExportResult && <button className="statusbar-file-action" type="button" title={gaussianExportResult} onClick={() => void revealFile(gaussianExportResult).catch((error: unknown) => setGaussianExportError(String(error)))}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{gaussianExportResult.split(/[\\/]/).at(-1)}</button>}
+      {gaussianExportResult && <button className="statusbar-file-action" type="button" title={gaussianExportResult} onClick={() => void revealGaussianExport(gaussianExportResult, false)}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{gaussianExportResult.split(/[\\/]/).at(-1)}</button>}
       {mode === "preview" && <span><b>{t("viewer.videoEncoding")}</b>{videoCapability.checking ? t("viewer.checking") : videoCapability.supported ? t("viewer.h264Ready") : t("common.unavailable")}</span>}
       {videoResult && mode === "preview" && <button className="statusbar-file-action" type="button" title={videoResult.path} onClick={() => void revealFile(videoResult.path)}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{videoResult.path.split(/[\\/]/).at(-1)} · {formatBytes(videoResult.fileSize, locale)}</button>}
       {htmlResult && <button className="statusbar-file-action" type="button" title={htmlResult.path} onClick={() => void revealFile(htmlResult.path).catch((error: unknown) => setHtmlError(String(error)))}><FolderOpen size={12} /><b>{t("viewer.exported")}</b>{htmlResult.path.split(/[\\/]/).at(-1)} · {formatBytes(htmlResult.fileSize, locale)}</button>}
     </footer>
     {store.saveError && mode === "adjust" && <div className="preview-save-error"><span>{store.saveError}</span><button type="button" onClick={retrySave}>{t("viewer.retrySave")}</button></div>}
     {saveNotice && <div className={`preview-video-message ${saveNotice === "viewFailed" ? "warning" : ""}`} role="status">{t(saveNotice === "viewFailed" ? "viewer.viewSaveFailed" : "viewer.editsSaved")}</div>}
-    {gaussianExporting && <div className="preview-video-message" role="status"><LoaderCircle className="spin" size={14} />{t("export.plyProgress", { value: Math.floor(gaussianExportProgress) })}</div>}
-    {gaussianExportError && <div className="preview-video-message error">{t("export.plyFailed", { detail: gaussianExportError })}</div>}
     {mode === "preview" && !videoCapability.checking && !videoCapability.supported && <div className="preview-video-message warning">{videoCapability.reason}</div>}
     {mode === "preview" && videoError && <div className="preview-video-message error">{t("viewer.exportFailed", { detail: videoError })}</div>}
     {htmlError && <div className="preview-video-message error">{t("export.failed", {detail:htmlError})}</div>}
     {htmlBusy && <div className="html-export-progress" role="status"><LoaderCircle className="spin" size={18} /><span>{t(htmlProgress?.phase === "packing" ? "export.packing" : htmlProgress?.phase === "completed" ? "export.completed" : "export.preparing")}</span><progress max="100" value={htmlProgress?.progress ?? 0} /><span>{Math.floor(htmlProgress?.progress ?? 0)}%</span><button type="button" onClick={cancelHtml}>{t("common.cancel")}</button></div>}
+    <PlyExportDialog
+      state={gaussianExportDialog}
+      progress={gaussianExportProgress}
+      onClose={closeGaussianExportDialog}
+      onRetry={() => void exportGaussian(modelFormat, true)}
+      onReveal={(path) => void revealGaussianExport(path)}
+      onCancel={() => void cancelModelExport()}
+      onConfirmAdjustment={(exportId, confirmationId) => modelOperationRef.current?.confirmAdjustment(exportId, confirmationId)}
+      format={modelFormat}
+    />
     {htmlConfirm && <div className="gaussian-save-backdrop" role="dialog" aria-modal="true" aria-labelledby="html-export-title" aria-describedby="html-export-description" onKeyDown={event => { if(event.key === "Escape")setHtmlConfirm(false); }}>
       <div className="gaussian-save-dialog"><div className="gaussian-save-symbol"><FileCode2 size={19} /></div><div><h2 id="html-export-title">{t("export.html")}</h2><p id="html-export-description">{t("export.htmlWarning", {size:formatBytes(Math.ceil(store.descriptor.fileSize*4/3),locale)})}</p></div><div className="gaussian-save-actions"><button autoFocus type="button" className="secondary" onClick={() => setHtmlConfirm(false)}>{t("common.cancel")}</button><button type="button" className="primary" onClick={() => void exportHtml()}><Download size={14} />{t("export.label")}</button></div></div>
     </div>}

@@ -3,6 +3,8 @@ import { NewTaskRow } from "../components/NewTaskRow";
 import { ProjectRow } from "../components/ProjectRow";
 import { ProjectResultStats } from "../components/ProjectResultStats";
 import { TaskConfiguration } from "../components/TaskConfiguration";
+import { MediaSourceStatus } from '../components/MediaSourceStatus';
+import { isProgressEvent, stagePercent } from '../lib/progressState';
 import { TaskProgress } from "../components/TaskProgress";
 import { taskIsActive } from "../types/tasks";
 import { SharedTaskDetail } from "../components/SharedTaskDetail";
@@ -22,12 +24,17 @@ import { UpdateNoticeDialog, UpdateSettingsRow } from "../components/UpdateNotic
 import { useUpdateNotice } from "./useUpdateNotice";
 import { ErrorReportDialog } from "../components/ErrorReportDialog";
 import { CompactError } from "../components/CompactError";
+import { failureCopy, failureGuidanceKind } from "../lib/failureGuidance";
+import { taskFailureContext, type FailureContext } from "../lib/pipelineError";
+import { GaussianImportDialog } from "../components/GaussianImportDialog";
+import { ImportedProjectDetails } from "../components/ImportedProjectDetails";
 import {
-  cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject, confirmLargeImageSequence, confirmSmallImageSequence,
+  cancelPipeline, checkColmapAcceleration, checkEngines, classifyDroppedInput, confirmAndDeleteProject,
   estimateProjectRuntime, getAppRuntimeStatus, getProjectOverview, getProjectTaskDetail, probeAndPlan, revealProject, revealProjectLogs,
   selectImageSequence, selectProjectsRoot, selectVideo,
   setProjectsRoot, startPipeline, prepareGaussianPreview, releaseGaussianPreview,
   initializeTelemetry, inspectReshootSource, onInputDragDrop, probeReshootInput, setTelemetryConsent, resumePipeline, startReshootPipeline,
+  selectGaussianImportSource, revealImportedSource, relinkImportedProject,
 } from "../lib/backend";
 import { startElapsedTicker } from "../lib/elapsedTimer";
 import { useTaskElapsed } from "./useTaskElapsed";
@@ -40,8 +47,10 @@ import { useGaussianTransformStore } from "../stores/gaussianTransformStore";
 import type { EngineStatus, InputType, PipelineEvent, PipelineResult, ProjectStatus, ProjectSummary, ProjectTaskDetail, Quality } from "../types/pipeline";
 import type { TelemetryPreferences as TelemetryPreferencesState } from "../types/telemetry";
 import { createGenerationDraft, createReshootDraft, draftDisplayName, loadTaskWorkspace, nextGenerationOrdinal, saveTaskWorkspace, type TaskDraft, type TaskSelection } from "./taskWorkspace";
-import { displayStatusForDraft, draftIsRunnable, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
+import { displayStatusForDraft, draftIsRunnable, draftProjectionReady, firstQueueInputIssue, queuedDraftIds, reorderDrafts, type DraftDisplayStatus } from "./taskQueue";
 import { loadUiPreferences, saveUiPreferences } from "./uiPreferences";
+import { GenerationPreflightDialog, type PreflightSession } from '../components/GenerationPreflightDialog';
+import { answerIsValid, collectPreflightQuestions, imageMatchingStrategy, preflightSnapshot, projectionIdentity, resolvedProjection, type PreflightAnswers, type PreflightQuestion } from './generationPreflight';
 
 const GaussianViewer = lazy(() => import("../components/GaussianViewer").then((module) => ({ default: module.GaussianViewer })));
 const CANCELLATION_OVERLAY_DELAY_MS = 300;
@@ -49,13 +58,12 @@ const PREVIEW_CLOSE_TIMEOUT_MS = 8_000;
 const NATIVE_ACTION_TIMEOUT_MS = 8_000;
 const DRAFT_DRAG_START_DISTANCE = 4;
 const DRAFT_DRAG_HOLD_MS = 200;
-const MIN_RECOMMENDED_IMAGE_COUNT = 30;
 const TASK_GROUPS_STORAGE_KEY = "ooo-splat-task-groups-v1";
 type TaskGroupKey = "new" | "completed" | "unfinished";
 type TaskGroupVisibility = Record<TaskGroupKey, boolean>;
 const DEFAULT_TASK_GROUP_VISIBILITY: TaskGroupVisibility = { new: true, completed: true, unfinished: true };
 type DetailErrorSource = "action" | "detail" | "draft" | "persisted" | "global";
-type DetailErrorRecord = { message: string; occurredAt: number; source: DetailErrorSource; contextKey: string };
+type DetailErrorRecord = { message: string; occurredAt: number; source: DetailErrorSource; contextKey: string; errorContext?: FailureContext };
 type DraftDragHold = { pointerId: number; draftId: string; startX: number; startY: number; target: HTMLElement; timer: number; active: boolean };
 const ERROR_SOURCE_PRIORITY: Record<DetailErrorSource, number> = { action: 4, draft: 4, detail: 3, persisted: 2, global: 1 };
 
@@ -98,6 +106,7 @@ const loadTaskGroupVisibility = (): TaskGroupVisibility => {
 };
 type FailureDialogState = {
   kind: PipelineFailureKind | "generic";
+  classificationVersion?: number;
   projectId: string | null;
   rawMessage: string;
   failureId: string | null;
@@ -112,21 +121,13 @@ const withTimeout = <T,>(operation: Promise<T>, timeoutMs: number, timeoutMessag
   );
 });
 
-const inferFailureDialog = (error: unknown, fallbackStage?: string, fallbackProjectId?: string): FailureDialogState | null => {
+const inferFailureDialog = (error: unknown, fallbackProjectId?: string): FailureDialogState | null => {
   const structured = pipelineCommandError(error);
   if (structured?.code === "cancelled") return null;
-  const stage = structured?.failedStage ?? fallbackStage;
   const rawMessage = structured?.message ?? pipelineErrorMessage(error) ?? "";
-  let kind = structured?.failureKind;
-  if (!kind && stage === "reconstructing") kind = "mapper_source";
-  if (!kind && stage === "trainingSplats") {
-    kind = /devicelost|device lost|device_lost|parent device is lost|vk_error_device_lost|dxgi_error_device_removed|显卡设备连接中断/i.test(rawMessage)
-      ? "brush_device_lost"
-      : /early eof|failed to load dataset|i\/o error|io error|no such file|access denied|permission denied/i.test(rawMessage)
-        ? "brush_dataset"
-        : "brush_gpu";
-  }
-  return { kind: kind ?? "generic", projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
+  const kind = failureGuidanceKind(error);
+  if (kind == null) return null;
+  return { kind, classificationVersion: structured?.classificationVersion, projectId: structured?.projectId ?? fallbackProjectId ?? null, rawMessage, failureId: structured?.failureId ?? null, engine: structured?.engine ?? "OOOSplat" };
 };
 
 function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }: {
@@ -140,29 +141,11 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
   const [reportOpen, setReportOpen] = useState(false);
   const [reportSent, setReportSent] = useState(false);
   useEffect(() => { setReportOpen(false); setReportSent(false); }, [failure]);
-  const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage";
-  const dataset = failure.kind === "brush_dataset";
+  const mapper = failure.kind === "mapper_source" || failure.kind === "mapper_storage" || failure.kind === "colmap_crash";
   const deviceLost = failure.kind === "brush_device_lost";
   const generic = failure.kind === "generic";
-  const title = generic ? t("failure.genericTitle") : mapper ? t("failure.mapperTitle") : dataset ? t("failure.brushDatasetTitle") : deviceLost ? t("failure.brushDeviceLostTitle") : t("failure.brushTitle");
-  const description = generic ? t("failure.genericDescription") : failure.kind === "mapper_source"
-    ? t("failure.mapperSource")
-    : failure.kind === "mapper_storage"
-      ? t("failure.mapperStorage")
-      : dataset
-        ? t("failure.brushDataset")
-        : deviceLost
-          ? t("failure.brushDeviceLost")
-        : t("failure.brushGpu");
-  const tips: TranslationKey[] = generic ? ["failure.genericTip1", "failure.storageTip1"] : failure.kind === "mapper_source"
-    ? ["failure.mapperTip1", "failure.mapperTip2", "failure.mapperTip3"]
-    : failure.kind === "mapper_storage"
-      ? ["failure.storageTip1", "failure.storageTip2"]
-      : dataset
-        ? ["failure.datasetTip1", "failure.datasetTip2"]
-        : deviceLost
-          ? ["failure.deviceLostTip1", "failure.deviceLostTip2", "failure.deviceLostTip3"]
-        : ["failure.brushTip1", "failure.brushTip2", "failure.brushTip3"];
+  const copy = failureCopy(failure.kind, failure.classificationVersion);
+  const title = t(copy.title), description = t(copy.description), tips = copy.tips;
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -182,8 +165,7 @@ function FailureGuidanceDialog({ failure, action, onClose, onRetry, onOpenLogs }
         <button type="button" aria-label={t("common.close")} disabled={action !== null} onClick={onClose}><X size={17} /></button>
       </div>
       <p>{description}</p>
-      <strong>{t("failure.solutions")}</strong>
-      <ul>{tips.map((key) => <li key={key}>{t(key)}</li>)}</ul>
+      {tips.length > 0 && <><strong>{t("failure.solutions")}</strong><ul>{tips.map((key) => <li key={key}>{t(key)}</li>)}</ul></>}
       {failure.rawMessage && <details><summary>{t("failure.details")}</summary><pre>{deviceLost ? localizePipelineMessage(locale, failure.rawMessage) : failure.rawMessage}</pre></details>}
       <div className="failure-guidance-actions">
         <button type="button" className="secondary" disabled={action !== null || !failure.projectId} onClick={onOpenLogs}>{action === "logs" ? <LoaderCircle className="spin" size={14} /> : <FolderOpen size={14} />}{t("failure.openLogs")}</button>
@@ -267,7 +249,7 @@ function DraftRow({ draft, selected, status, insertion, dragging, onSelect, onDe
 }) {
   const { t } = useI18n();
   const statusKeyByValue: Record<DraftDisplayStatus, TranslationKey> = { standby: "task.idle", preparing: "task.preparing", queued: "task.queued", running: "task.running" };
-  return <NewTaskRow draftId={draft.id} title={draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))} path={draft.inputPath} status={status} statusLabel={t(statusKeyByValue[status])} selected={selected} canReorder={!draft.running} error={draft.error} insertion={insertion} dragging={dragging} onSelect={onSelect} onDelete={onDelete} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerEnd={onPointerEnd} onKeyboardMove={onKeyboardMove} />;
+  return <NewTaskRow draftId={draft.id} title={draftDisplayName(draft, t("workspace.newTask"), t("project.reshoot"))} path={draft.inputPath} status={status} statusLabel={t(statusKeyByValue[status])} selected={selected} canReorder={!draft.running} error={draft.error} errorContext={draft.errorContext} insertion={insertion} dragging={dragging} onSelect={onSelect} onDelete={onDelete} onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerEnd={onPointerEnd} onKeyboardMove={onKeyboardMove} />;
 }
 
 
@@ -336,6 +318,13 @@ export function App() {
   taskWorkspaceRef.current = taskWorkspace;
   const [runGateBusy, setRunGateBusy] = useState(false);
   const [autoRunNext, setAutoRunNext] = useState(false);
+  const [preflight, setPreflight] = useState<PreflightSession | null>(null);
+  const preflightRef = useRef<PreflightSession | null>(null);
+  const queueCheckingRef = useRef(false);
+  const queueCompletionRef = useRef<Promise<void> | null>(null);
+  const [queueChecking, setQueueChecking] = useState(false);
+  const [queueInputNotice, setQueueInputNotice] = useState<string | null>(null);
+  useEffect(() => () => { preflightRef.current?.resolve(null); preflightRef.current = null; }, []);
   const [inputDropActive, setInputDropActive] = useState(false);
   const [draftDrag, setDraftDrag] = useState<{ id: string; insertionIndex: number } | null>(null);
   const draftDragRef = useRef(draftDrag);
@@ -349,12 +338,14 @@ export function App() {
   const [projectEstimate, setProjectEstimate] = useState<{ projectId: string; value: Awaited<ReturnType<typeof estimateProjectRuntime>> } | null>(null);
   const [projectDetailLoading, setProjectDetailLoading] = useState(false);
   const [projectDetailError, setProjectDetailError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
-  const [projectActionError, setProjectActionError] = useState<{ projectId: string; message: string; occurredAt: number } | null>(null);
+  const [projectActionError, setProjectActionError] = useState<{ projectId: string; message: string; occurredAt: number; errorContext?: FailureContext } | null>(null);
   const [globalDetailError, setGlobalDetailError] = useState<DetailErrorRecord | null>(null);
   const dismissedErrorThrough = useRef(new Map<string, number>());
   const [dismissedErrorRevision, setDismissedErrorRevision] = useState(0);
   const [expandedGroups, setExpandedGroups] = useState<TaskGroupVisibility>(loadTaskGroupVisibility);
   const [reshootBusy, setReshootBusy] = useState(false);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
+  const [gaussianImportSelectionId, setGaussianImportSelectionId] = useState<string | null>(null);
   const drafts = taskWorkspace.drafts;
   const selectedTask = taskWorkspace.selected;
   const selectedSharedTask = selectedTask.kind === "task" ? sharedTasks[selectedTask.id] : selectedTask.kind === "project" ? Object.values(sharedTasks).find(task => task.project_id === selectedTask.id && !task.project_deleted) : null;
@@ -367,6 +358,7 @@ export function App() {
   submittedIdsRef.current = new Set(Object.keys(sharedTasks));
   const submittedIdsKey = Object.keys(sharedTasks).sort().join('|');
   const selectedDraft = selectedTask.kind === "draft" ? drafts.find((draft) => draft.id === selectedTask.id) ?? null : null;
+  const selectedReshootSourceProject = selectedDraft?.kind === "reshoot" ? store.projects.find(project => project.id === selectedDraft.sourceProjectId) ?? null : null;
   const selectedProject = selectedTask.kind === "project"
     ? store.projects.find((project) => project.id === selectedTask.id)
       ?? (projectDetail?.project.id === selectedTask.id ? projectDetail.project : null)
@@ -375,6 +367,10 @@ export function App() {
   const missingEngines = store.engines.filter((engine) => !engineReady(engine));
   const sharedProjectIds = new Set(Object.values(sharedTasks).filter(task => !task.project_deleted).map(task => task.project_id));
   const completed = store.projects.filter(project => project.status === "completed" && !sharedProjectIds.has(project.id));
+  const completedRows = [
+    ...submittedCompleted.map(task => ({ kind: "task" as const, id: task.task_id, time: timestampOf(task.result?.completedAt ?? task.updated_at), task })),
+    ...completed.map(project => ({ kind: "project" as const, id: project.id, time: timestampOf(project.completedAt ?? project.createdAt), project })),
+  ].sort((left, right) => right.time - left.time || right.id.localeCompare(left.id));
   const unfinished = useMemo(() => store.projects.filter((project) => project.status !== "completed" && !sharedProjectIds.has(project.id) && !drafts.some((draft) => draft.running && (draft.linkedProjectId === project.id || draft.id === project.workspaceTaskId))), [drafts, store.projects, sharedTasks]);
   const projectSyncKey = Object.values(sharedTasks).filter(task => task.project_id && !task.project_deleted)
     .map(task => `${task.project_id}:${task.run_id}:${task.status}`).sort().join("|");
@@ -388,9 +384,9 @@ export function App() {
   }, [projectSyncKey]);
   const progressEvent = useMemo(() => {
     if (!store.latestEvent || !["failed", "cancelled"].includes(store.latestEvent.stage)) return store.latestEvent;
-    return [...store.events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage)) ?? null;
+    return [...store.events].reverse().find((event) => isProgressEvent(event) && !["failed", "cancelled"].includes(event.stage)) ?? null;
   }, [store.events, store.latestEvent]);
-  const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime);
+  const currentMessage = useProgressMessage(store.phase, progressEvent?.stage ?? null, store.events, store.latestRuntime, progressEvent ?? undefined);
   const messageOf = useCallback((error: unknown) => rawMessageOf(error) ?? t("error.generic"), [t]);
   const queuedDrafts = useMemo(
     () => queuedDraftIds(drafts, activeDraftId, autoRunNext, Boolean(store.projectsRoot) && missingEngines.length === 0),
@@ -416,7 +412,7 @@ export function App() {
         if (draft.id !== id) return draft;
         const patch = typeof update === "function" ? update(draft) : update;
         const errorStamp = Object.prototype.hasOwnProperty.call(patch, "error")
-          ? { errorAt: patch.error ? Date.now() : null }
+          ? { errorAt: patch.error ? Date.now() : null, errorContext: patch.errorContext }
           : {};
         return { ...draft, ...patch, ...errorStamp };
       }),
@@ -436,8 +432,9 @@ export function App() {
 
   const visibleDetailError = useMemo<DetailErrorRecord | null>(() => {
     const candidates: DetailErrorRecord[] = [];
-    if (selectedDraft?.error) candidates.push({
+    if (selectedDraft?.error && selectedDraft.error !== selectedDraft.inputError) candidates.push({
       message: selectedDraft.error,
+      errorContext: selectedDraft.errorContext,
       occurredAt: selectedDraft.errorAt ?? 0,
       source: "draft",
       contextKey: detailContextKey,
@@ -495,6 +492,83 @@ export function App() {
     setAutoRunNext(enabled);
   }, []);
 
+  function finishPreflight(answers: PreflightAnswers | null) {
+    const session = preflightRef.current;
+    preflightRef.current = null;
+    setPreflight(null);
+    session?.resolve(answers);
+  }
+
+  async function confirmPreflight(questions: PreflightQuestion[], finalLabel: string): Promise<PreflightAnswers | null> {
+    if (!questions.length) return {};
+    if (preflightRef.current) return null;
+    const answers = await new Promise<PreflightAnswers | null>(resolve => {
+      const session = { questions, finalLabel, resolve };
+      preflightRef.current = session;
+      setPreflight(session);
+    });
+    if (!answers || !questions.every(question => answerIsValid(question, answers[question.id]))) return null;
+    // Apply answers atomically only to the exact task/input snapshots shown.
+    for (const question of questions) {
+      const current = taskWorkspaceRef.current.drafts.find(draft => draft.id === question.draft.id);
+      if (!current || current.inputChecking || preflightSnapshot(current) !== question.snapshot) {
+        if (current) updateDraft(current.id, { error: t('preflight.changed') });
+        return null;
+      }
+    }
+    return answers;
+  }
+
+  function showQueueInputIssue(issue: NonNullable<ReturnType<typeof firstQueueInputIssue>>) {
+    setAutoQueueEnabled(false);
+    setQueueInputNotice(t(issue.reason === 'projection' ? issue.draft.inputType === 'images' ? 'source.queueChooseImageType' : 'source.queueChooseType' : issue.reason === 'checking' ? 'source.queueChecking' : 'source.queueAnalysisFailed', { name: draftDisplayName(issue.draft, t('workspace.newTask'), t('project.reshoot')) }));
+    selectDraft(issue.draft.id);
+  }
+
+  function chooseVideoProjection(id: string, identity: string, value: import('../types/pipeline').VideoProjection) {
+    const draft = taskWorkspaceRef.current.drafts.find(item => item.id === id);
+    if (!draft || draft.running || draft.inputChecking || projectionIdentity(draft) !== identity || !draft.projectionDetection?.requiresChoice) return;
+    if (value === 'equirectangular' && !draft.projectionDetection.supportedErp) return;
+    queueRevisionRef.current += 1;
+    updateDraft(id, { videoProjection: value, projectionAnswer: value === 'auto' ? null : { identity, projection: value }, error: null });
+    setQueueInputNotice(null);
+  }
+
+  async function checkQueueInputs(enable: boolean) {
+    if (queueCheckingRef.current || preflightRef.current) return;
+    queueCheckingRef.current = true;
+    setQueueChecking(true);
+    setQueueInputNotice(null);
+    let complete!: () => void;
+    const revision = queueRevisionRef.current;
+    queueCompletionRef.current = new Promise<void>(resolve => { complete = resolve; });
+    try {
+      while (true) {
+        const draft = taskWorkspaceRef.current.drafts.find(item => item.kind === 'generation' && !item.running && item.inputPath && (item.needsValidation || item.inputChecking || (!item.plan && !item.inputError && !item.error)));
+        if (!draft?.inputPath) break;
+        const pending = inputAnalysisPromises.current.get(draft.id);
+        if (pending) await pending;
+        else if (!draft.inputChecking) await analyze(draft.id, draft.inputPath, draft.quality, draft.plannerEnabled);
+        else break;
+      }
+      const issue = firstQueueInputIssue(taskWorkspaceRef.current.drafts);
+      if (issue) showQueueInputIssue(issue);
+      else if (enable && revision === queueRevisionRef.current) setAutoQueueEnabled(true);
+    } catch (error) {
+      setAutoQueueEnabled(false);
+      useAppStore.getState().setError(messageOf(error));
+    } finally { queueCheckingRef.current = false; queueCompletionRef.current = null; complete(); setQueueChecking(false); }
+  }
+
+  // A new ambiguous source stops the queue; type selection stays in its media picker.
+  useEffect(() => {
+    if (autoRunNext && !queueChecking) {
+      const issue = firstQueueInputIssue(drafts);
+      if (issue && issue.reason !== 'checking') showQueueInputIssue(issue);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRunNext, drafts, queueChecking]);
+
   const selectDraft = useCallback((id: string) => {
     mutateTaskWorkspace((workspace) => ({ ...workspace, selected: { kind: "draft", id } }));
     setProjectDetail(null);
@@ -544,6 +618,36 @@ export function App() {
   const toggleTaskGroup = useCallback((group: TaskGroupKey) => {
     setExpandedGroups((groups) => ({ ...groups, [group]: !groups[group] }));
   }, []);
+
+  const chooseGaussianImport = useCallback(async (kind: "file" | "folder") => {
+    setImportMenuOpen(false);
+    try {
+      const selection = await selectGaussianImportSource(kind);
+      if (selection) setGaussianImportSelectionId(selection.selectionId);
+    } catch (error) {
+      useAppStore.getState().setError(messageOf(error));
+    }
+  }, [messageOf]);
+
+  const finishGaussianImport = useCallback((project: ProjectSummary) => {
+    useAppStore.getState().setProjects([project, ...useAppStore.getState().projects.filter(item => item.id !== project.id)]);
+    setGaussianImportSelectionId(null);
+    setExpandedGroups(groups => ({ ...groups, completed: true }));
+    selectProject(project);
+  }, [selectProject]);
+
+  const relinkImportedSource = useCallback(async (projectId: string) => {
+    try {
+      const selection = await selectGaussianImportSource("file");
+      if (!selection) return;
+      const updated = await relinkImportedProject(projectId, selection.selectionId);
+      const projects = useAppStore.getState().projects;
+      useAppStore.getState().setProjects(projects.map(item => item.id === updated.id ? updated : item));
+      setProjectDetail(null);
+    } catch (error) {
+      setProjectActionError({ projectId, message: messageOf(error), occurredAt: Date.now() });
+    }
+  }, [messageOf]);
 
   const removeDraft = useCallback((id: string) => {
     queueRevisionRef.current += 1;
@@ -971,19 +1075,44 @@ export function App() {
     }
   };
 
-  const analyze = (draftId: string, path: string, quality: Quality, plannerEnabled: boolean) => {
+  const analyze = (draftId: string, path: string, quality: Quality, plannerEnabled: boolean, reuseVideo = false) => {
+    const draft = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+    let videoAnalysis: import('../types/pipeline').InputAnalysis | undefined = reuseVideo && draft?.inputPath === path && (draft.video || draft.imageSequence) && draft.projectionDetection?.sourceIdentity
+      ? { inputType: draft.inputType, video: draft.video, imageSequence: draft.imageSequence, projectionDetection: draft.projectionDetection } : undefined;
     const revision = (inputAnalysisRevisions.current.get(draftId) ?? 0) + 1;
     inputAnalysisRevisions.current.set(draftId, revision);
-    updateDraft(draftId, { error: null, needsValidation: false, inputChecking: true });
+    updateDraft(draftId, { error: null, inputError: null, needsValidation: false, inputChecking: true, inputPlanning: !!videoAnalysis });
     const analysis = (async () => {
       try {
-        const result = await probeAndPlan(path, quality, plannerEnabled);
+        let result: Awaited<ReturnType<typeof probeAndPlan>>;
+        // A pending probe/plan owns this draft until its result matches the latest settings.
+        // Quality changes during detection must not launch another FFprobe process.
+        for (;;) {
+          result = await probeAndPlan(path, quality, plannerEnabled, videoAnalysis, metadata => {
+            if (inputAnalysisRevisions.current.get(draftId) !== revision) return;
+            const current = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+            if (!current || current.inputPath !== path) return;
+            const changed = current.projectionAnswer && current.projectionAnswer.identity !== metadata.projectionDetection.sourceIdentity;
+            updateDraft(draftId, { ...metadata, inputPlanning: true, ...(changed ? { projectionAnswer: null, videoProjection: 'auto' as const } : {}) });
+            videoAnalysis = metadata;
+          });
+          if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
+          const latest = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+          if (!latest || latest.inputPath !== path) return false;
+          if (latest.quality === quality && latest.plannerEnabled === plannerEnabled) break;
+          quality = latest.quality;
+          plannerEnabled = latest.plannerEnabled;
+          videoAnalysis = result.projectionDetection?.sourceIdentity
+            ? { inputType: result.inputType, video: result.video, imageSequence: result.imageSequence, projectionDetection: result.projectionDetection } : undefined;
+        }
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { inputType: result.inputType, video: result.video, imageSequence: result.imageSequence, plan: result.plan, estimate: result.estimate, error: null, inputChecking: false });
+        const current = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+        const changedIdentity = current?.projectionAnswer && current.projectionAnswer.identity !== result.projectionDetection?.sourceIdentity;
+        updateDraft(draftId, { inputType: result.inputType, video: result.video, projectionDetection: result.projectionDetection ?? null, imageSequence: result.imageSequence, plan: result.plan, estimate: result.estimate, error: null, inputError: null, inputChecking: false, inputPlanning: false, ...(changedIdentity ? { projectionAnswer: null, videoProjection: 'auto' as const } : {}) });
         return true;
       } catch (error) {
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { video: null, imageSequence: null, plan: null, estimate: null, error: messageOf(error), inputChecking: false });
+        updateDraft(draftId, { video: null, projectionDetection: null, imageSequence: null, plan: null, estimate: null, error: messageOf(error), inputError: messageOf(error), inputChecking: false, inputPlanning: false });
         return false;
       }
     })();
@@ -1003,7 +1132,7 @@ export function App() {
       try {
         const source = await inspectReshootSource(sourceProjectId);
         if (inputAnalysisRevisions.current.get(draftId) !== revision) return false;
-        updateDraft(draftId, { reshootSource: source, plannerEnabled: source.plannerEnabled });
+        updateDraft(draftId, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }) });
         if (!source.eligible) {
           updateDraft(draftId, { error: source.reason ?? t("reshoot.ineligible"), inputChecking: false });
           return false;
@@ -1032,7 +1161,8 @@ export function App() {
     if (!draft || draft.running) return false;
     queueRevisionRef.current += 1;
     updateDraft(draftId, {
-      inputPath: path, inputType, video: null, imageSequence: null, plan: null,
+      ...(draft.inputPath !== path ? { videoProjection: "auto" as const, projectionDetection: null, projectionAnswer: null } : {}),
+      inputPath: path, inputType, video: null, imageSequence: null, plan: null, inputError: null,
       estimate: null, reshootPlan: null, error: null,
     });
     if (draft.kind === "generation") {
@@ -1047,7 +1177,7 @@ export function App() {
   };
 
   const chooseInput = async (inputType: InputType) => {
-    if (!selectedDraft || selectedDraft.kind !== "generation") return;
+    if (!selectedDraft || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     try {
       const selected = inputType === "images" ? await selectImageSequence() : await selectVideo();
       if (selected) await applyInputToDraft(selectedDraft.id, selected, inputType);
@@ -1117,18 +1247,18 @@ export function App() {
   };
 
   const chooseQuality = async (quality: Quality) => {
-    if (!selectedDraft || selectedDraft.kind !== "generation") return;
+    if (!selectedDraft || selectedDraft.running || selectedDraft.quality === quality || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { quality, plan: null, estimate: null, error: null });
-    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled);
+    if (selectedDraft.kind === "generation" && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyze(selectedDraft.id, selectedDraft.inputPath, quality, selectedDraft.plannerEnabled, true);
   };
 
   const changePlannerEnabled = async () => {
-    if (!selectedDraft || selectedDraft.kind !== "generation" || selectedDraft.running) return;
+    if (!selectedDraft || selectedDraft.running || (selectedDraft.kind !== "generation" && !selectedDraft.reshootSource?.imported)) return;
     const enabled = !selectedDraft.plannerEnabled;
     queueRevisionRef.current += 1;
     updateDraft(selectedDraft.id, { plannerEnabled: enabled, plannerDefaultPending: false, plan: null, estimate: null, error: null });
-    if (selectedDraft.inputPath) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled);
+    if (selectedDraft.kind === "generation" && selectedDraft.inputPath && !selectedDraft.inputChecking) await analyze(selectedDraft.id, selectedDraft.inputPath, selectedDraft.quality, enabled, true);
   };
 
   const requestCancellation = async () => {
@@ -1152,24 +1282,25 @@ export function App() {
   const generate = async (draftId = selectedDraft?.id, source: "manual" | "queue" = "manual") => {
     const draft = taskWorkspaceRef.current.drafts.find((item) => item.id === draftId);
     if (!draft || draft.kind !== "generation" || !draft.inputPath || !draft.plan || !store.projectsRoot) return;
+    if (draft.inputChecking || draft.needsValidation || !draftProjectionReady(draft)) return;
+    if (preflightRef.current || queueCheckingRef.current) return;
     if (!claimRunGate()) return;
-    let largeSequenceAccepted = true;
+    let preflightAnswers: PreflightAnswers | null = null;
     try {
-      if (source === "manual" && draft.inputType === "images" && draft.imageSequence && draft.imageSequence.imageCount < MIN_RECOMMENDED_IMAGE_COUNT) {
-        largeSequenceAccepted = await confirmSmallImageSequence(draft.imageSequence.imageCount);
-      }
-      if (largeSequenceAccepted && draft.inputType === "images" && draft.imageSequence?.requiresLargeSequenceConfirmation) {
-        largeSequenceAccepted = await confirmLargeImageSequence(draft.imageSequence.imageCount);
-      }
+      const snapshot = preflightSnapshot(draft);
+      preflightAnswers = await confirmPreflight(collectPreflightQuestions([draft]).filter(question => source === 'manual' || question.kind !== 'smallImages'), t('generate.start'));
+      const current = taskWorkspaceRef.current.drafts.find(item => item.id === draftId);
+      if (!current || snapshot !== preflightSnapshot(current) || current.inputChecking || !current.inputPath || !current.plan) preflightAnswers = null;
     } catch (error) {
       updateDraft(draft.id, { error: messageOf(error) });
-      largeSequenceAccepted = false;
+      preflightAnswers = null;
     }
-    if (!largeSequenceAccepted) {
+    if (!preflightAnswers) {
       releaseRunGate();
       if (autoRunNextRef.current) setAutoQueueEnabled(false);
       return;
     }
+    if (!draft?.inputPath || !draft.plan) { releaseRunGate(); return; }
     clearCancellationFeedback();
     runElapsedOffset.current = 0;
     runStartedAt.current = Date.now();
@@ -1192,7 +1323,7 @@ export function App() {
     let promoted = false;
     let nextIndex = 0;
     try {
-      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, draft.plannerEnabled, draft.id);
+      const result = await startPipeline(draft.inputPath, draft.quality, store.projectsRoot, draft.plannerEnabled, draft.id, resolvedProjection(taskWorkspaceRef.current.drafts.find(item => item.id === draft.id) ?? draft), draft.projectionDetection?.sourceIdentity, imageMatchingStrategy(draft, preflightAnswers));
       setLiveElapsedMs((current) => Math.max(current, result.durationMs));
       store.setResult(result);
       store.setPhase("completed");
@@ -1207,14 +1338,18 @@ export function App() {
         setLiveElapsedMs(Math.max(backendElapsed, Date.now() - runStartedAt.current));
       }
       const message = messageOf(error);
-      updateDraft(draft.id, { error: message });
+      updateDraft(draft.id, { error: message, errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
-      if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
-      if (!cancelled && !taskBusy) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage));
+      const inputChanged=typeof error==='object' && error!==null && 'code' in error && error.code==='INPUT_CHANGED';
+      if (inputChanged) {
+        store.setPhase('idle');
+        await analyze(draft.id, draft.inputPath, draft.quality, draft.plannerEnabled);
+        updateDraft(draft.id, { error: t('preflight.changed') });
+      } else if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
+      if (!cancelled && !taskBusy && !inputChanged) {
+        setFailureDialog(inferFailureDialog(error));
       }
     } finally {
       if (!succeeded) {
@@ -1270,14 +1405,13 @@ export function App() {
       const backendElapsed = useAppStore.getState().latestEvent?.elapsedMs ?? 0;
       setLiveElapsedMs(runElapsedOffset.current + backendElapsed);
       const message = messageOf(error);
-      setProjectActionError({ projectId: project.id, message, occurredAt: Date.now() });
+      setProjectActionError({ projectId: project.id, message, occurredAt: Date.now(), errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
       if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
       if (!cancelled && !taskBusy) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage, project.id));
+        setFailureDialog(inferFailureDialog(error, project.id));
       }
     } finally {
       if (!completedProject) {
@@ -1396,7 +1530,7 @@ export function App() {
   const openReshoot = (project: ProjectSummary) => {
     if (reshootBusy) return;
     queueRevisionRef.current += 1;
-    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality, useAppStore.getState().plannerEnabled);
+    const draft = createReshootDraft(taskWorkspace.nextOrdinal, project.id, project.name, project.quality ?? "balanced", useAppStore.getState().plannerEnabled);
     setExpandedGroups((groups) => ({ ...groups, new: true }));
     setProjectActionError(null);
     setTaskWorkspace((workspace) => ({ drafts: [...workspace.drafts, draft], selected: { kind: "draft", id: draft.id }, nextOrdinal: workspace.nextOrdinal + 1 }));
@@ -1418,7 +1552,7 @@ export function App() {
     try {
       const source = await inspectReshootSource(draft.sourceProjectId);
       if (!source.eligible) {
-        updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.reason ?? t("reshoot.ineligible") });
+        updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.reason ?? t("reshoot.ineligible") });
         if (autoRunNextRef.current) setAutoQueueEnabled(false);
         return;
       }
@@ -1455,6 +1589,8 @@ export function App() {
         inputType: draft.inputType,
         projectsRoot: store.projectsRoot,
         workspaceTaskId: draft.id,
+        quality: draft.quality,
+        plannerEnabled: draft.plannerEnabled,
       });
       store.setResult(result);
       store.setPhase("completed");
@@ -1465,14 +1601,13 @@ export function App() {
       await refreshCompletedProject(promotion.project);
     } catch (error) {
       const message = messageOf(error);
-      updateDraft(draft.id, { error: message });
+      updateDraft(draft.id, { error: message, errorContext: pipelineCommandError(error) ?? undefined });
       const latestStage = useAppStore.getState().latestEvent?.stage;
       const cancelled = pipelineWasCancelled(error, latestStage);
       const taskBusy=typeof error==="object" && error!==null && "code" in error && error.code==="TASK_BUSY";
       if (!taskBusy) store.setPhase(cancelled ? "cancelled" : "failed");
       if (!cancelled && !taskBusy) {
-        const fallbackStage = [...useAppStore.getState().events].reverse().find((event) => !["failed", "cancelled"].includes(event.stage))?.stage;
-        setFailureDialog(inferFailureDialog(error, fallbackStage));
+        setFailureDialog(inferFailureDialog(error));
       }
     } finally {
       if (!succeeded) {
@@ -1498,7 +1633,11 @@ export function App() {
   };
 
   async function continueAutoQueue(nextIndex: number): Promise<void> {
+    if (queueCompletionRef.current) await queueCompletionRef.current;
     while (autoRunNextRef.current) {
+      if (queueCompletionRef.current) { await queueCompletionRef.current; if (!autoRunNextRef.current) return; }
+      await checkQueueInputs(false);
+      if (!autoRunNextRef.current) return;
       const revision = queueRevisionRef.current;
       let candidate = taskWorkspaceRef.current.drafts[nextIndex];
       if (!candidate || !candidate.inputPath || !store.projectsRoot) {
@@ -1538,7 +1677,7 @@ export function App() {
     else {
       updateDraft(draft.id, { inputChecking: true, needsValidation: false });
       void inspectReshootSource(draft.sourceProjectId)
-        .then((source) => updateDraft(draft.id, { reshootSource: source, plannerEnabled: source.plannerEnabled, error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
+        .then((source) => updateDraft(draft.id, { reshootSource: source, ...(source.imported ? {} : { plannerEnabled: source.plannerEnabled }), error: source.eligible ? null : source.reason ?? t("reshoot.ineligible"), inputChecking: false }))
         .catch((error) => updateDraft(draft.id, { error: messageOf(error), inputChecking: false }));
     }
   // Validation is intentionally lazy and keyed only by selection.
@@ -1611,16 +1750,20 @@ export function App() {
     : null;
   const activeStageProgress = store.latestEvent == null
     ? null
-    : [...store.events].reverse().find((event) => event.stage === store.latestEvent?.stage && event.stageProgress != null)?.stageProgress ?? null;
+    : stagePercent(store.latestEvent);
   const detailErrorDismissible = !selectedProject || selectedProject.status === "completed";
   const detailErrorBanner = visibleDetailError
-    ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
+    ? <div className="inline-error detail-error" role="alert"><CircleAlert size={16} /><CompactError message={visibleDetailError.message} context={visibleDetailError.errorContext} />{detailErrorDismissible && <button type="button" onClick={closeVisibleDetailError}>{t("common.close")}</button>}</div>
     : null;
   const projectConfigurationDetails = selectedProject && projectDetail
-    ? <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType} quality={selectedProject.quality} plannerEnabled={projectDetail.plannerEnabled} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
+    ? projectDetail.imported
+      ? <ImportedProjectDetails detail={projectDetail} onRevealSource={() => void revealImportedSource(selectedProject.id).catch(error => setProjectActionError({ projectId: selectedProject.id, message: messageOf(error), occurredAt: Date.now() }))} onRelink={() => void relinkImportedSource(selectedProject.id)} />
+      : <TaskConfiguration sourcePath={projectDetail.sourcePath ?? selectedProject.sourceName} projectsRoot={projectDetail.projectsRoot ?? parentPath(selectedProject.projectPath)} inputType={projectDetail.inputType!} quality={selectedProject.quality!} plannerEnabled={projectDetail.plannerEnabled!} completed={selectedProject.status === "completed"} inheritedFrom={selectedProject.status === "completed" ? null : projectDetail.sourceProjectId ? "reshoot" : "resume"} acceleration={systemAcceleration} videoProjection={projectDetail.videoProjection} inputProjection={projectDetail.inputProjection} video={projectDetail.video} imageSequence={projectDetail.imageSequence} estimatedFrames={projectDetail.estimatedFrames} estimate={projectEstimate?.projectId === selectedProject.id ? projectEstimate.value : null} />
     : null;
   const historicalTaskProgress = selectedProject && projectDetail
-    ? <TaskProgress historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
+    ? projectDetail.imported || projectDetail.stage == null || projectDetail.progress == null
+      ? null
+      : <TaskProgress progressKey={`project:${selectedProject.id}`} historical status={selectedProject.status} stage={projectDetail.stage} progress={projectDetail.progress} logs={projectDetail.logs.map((line, index) => ({ key: `${line.source}:${index}`, source: line.source, text: line.message }))} />
     : null;
 
   const renderSharedNewRows = () => submittedNew.map(task => {
@@ -1630,13 +1773,13 @@ export function App() {
     return <NewTaskRow key={task.task_id} taskId={task.task_id} title={title} path={task.input_path}
       status={taskIsActive(task) ? "running" : task.status} statusLabel={taskStatusLabel(locale, task.status)}
       selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
-      canReorder={false} agentCreated={task.source === "mcp"} error={task.error?.message}
+      canReorder={false} agentCreated={task.source === "mcp"} error={task.error?.message} errorContext={taskFailureContext(task.error)}
       onSelect={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))} />;
   });
 
-  const renderSharedRows = (items: import("../types/tasks").SharedTask[]) => items.map(task => {
+  const renderSharedRow = (task: import("../types/tasks").SharedTask) => {
     const project = taskProjectSummary(task, store.projects.find(item => item.id === task.project_id));
-    return <ProjectRow key={task.task_id} task={task} project={project}
+    return <ProjectRow key={`task:${task.task_id}`} task={task} project={project}
       selected={(selectedTask.kind === "task" && selectedTask.id === task.task_id) || (selectedTask.kind === "project" && selectedTask.id === task.project_id)}
       busy={runBusy} previewing={openingPreviewProjectId === task.project_id}
       previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === task.project_id}
@@ -1644,7 +1787,9 @@ export function App() {
       onSelect={selectProject} onSelectTask={() => mutateTaskWorkspace(workspace => ({ ...workspace, selected: { kind: "task", id: task.task_id } }))}
       onPreview={item => void previewProject(item)} onReshoot={item => void openReshoot(item)}
       onResume={item => void resume(item)} onReveal={item => void showProject(item)} onDelete={item => void removeProject(item)} />;
-  });
+  };
+  const renderSharedRows = (items: import("../types/tasks").SharedTask[]) => items.map(renderSharedRow);
+  const renderCompletedProjectRow = (project: ProjectSummary) => <ProjectRow key={`project:${project.id}`} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />;
 
   if (viewMode === "preview") {
     return <main className="app-shell preview-mode">
@@ -1682,7 +1827,7 @@ export function App() {
 
         {selectedDraft?.kind === "generation" && <><div className="form-section">
           <div className="field-label-row input-label-row"><label className="field-label">{t("input.label")}</label><CaptureAdviceHelp /></div>
-          <div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
+          <div className="source-input-card"><div ref={inputDropZoneRef} className={inputDropActive ? "input-picker drop-active" : "input-picker"}>
             <div className="input-type-picker">
               <button className="input-picker-toggle" type="button" disabled={selectedDraft.running} aria-label={t("input.typeAria")} aria-expanded={inputMenuOpen} onClick={() => setInputMenuOpen((open) => !open)}>
                 {selectedDraft.inputType === "images" ? <Images size={16} /> : <Clapperboard size={16} />}
@@ -1694,14 +1839,15 @@ export function App() {
                 <button type="button" role="menuitemradio" aria-checked={selectedDraft.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>{t("input.images")}</strong><small>{t("input.imageTypes")}</small></span></button>
               </div>}
             </div>
-            <button className="path-picker" type="button" disabled={selectedDraft.running} onClick={() => void chooseInput(selectedDraft.inputType)}>
-              {selectedDraft.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
+            <button className={selectedDraft.inputPath ? 'path-picker media-path' : 'path-picker media-path empty'} type="button" disabled={selectedDraft.running} onClick={() => void chooseInput(selectedDraft.inputType)}>
               <span>
-                <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
+                <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : t('source.empty')}</strong>
                 <small>{selectedDraft.inputPath ? displayPath(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint")}</small>
               </span>
             </button>
             {inputDropActive && <div className="input-drop-overlay" aria-hidden="true"><Upload size={18} /><span>{t("input.dropHere")}</span></div>}
+          </div>
+          {selectedDraft.inputPath && <MediaSourceStatus inputType={selectedDraft.inputType} checking={(selectedDraft.inputChecking && !selectedDraft.inputPlanning) || selectedDraft.needsValidation} error={selectedDraft.inputError} detection={selectedDraft.projectionDetection} projection={resolvedProjection(selectedDraft)} disabled={selectedDraft.running} onRetry={() => void analyze(selectedDraft.id, selectedDraft.inputPath!, selectedDraft.quality, selectedDraft.plannerEnabled)} onProjectionChange={value => chooseVideoProjection(selectedDraft.id, projectionIdentity(selectedDraft), value)} />}
           </div>
         </div>
 
@@ -1749,9 +1895,7 @@ export function App() {
           <span><strong>{selectedDraft.inputType === "images" ? t("alpha.imagesTitle") : t("alpha.videoTitle")}</strong><small>{selectedDraft.inputType === "images" ? t("alpha.imagesHint") : t("alpha.videoHint", { format: selectedDraft.video?.pixelFormat || "Alpha" })}</small></span>
         </div>}
 
-        {selectedDraft.imageSequence?.requiresLargeSequenceConfirmation && <div className="sequence-warning" role="status"><CircleAlert size={16} /><span><strong>{t("sequence.title")}</strong><small>{t("sequence.hint")}</small></span></div>}
-
-        <button className="primary-action" type="button" disabled={runBusy || selectedDraft.inputChecking || !selectedDraft.inputPath || !selectedDraft.plan || !store.projectsRoot || missingEngines.length > 0} onClick={() => void generate()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
+        <button className="primary-action" type="button" disabled={runBusy || queueChecking || !!preflight || selectedDraft.inputChecking || selectedDraft.needsValidation || !draftProjectionReady(selectedDraft) || !selectedDraft.inputPath || !selectedDraft.plan || !store.projectsRoot || missingEngines.length > 0} onClick={() => void generate()}><Play size={16} fill="currentColor" />{t("generate.start")}</button>
         {detailErrorBanner}
         </>}
 
@@ -1773,8 +1917,7 @@ export function App() {
                   <button type="button" role="menuitemradio" aria-checked={selectedDraft.inputType === "images"} onClick={() => chooseInputType("images")}><Images size={15} /><span><strong>{t("input.images")}</strong><small>{t("input.imageTypes")}</small></span></button>
                 </div>}
               </div>
-              <button className="path-picker" type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} onClick={() => void chooseReshootInput(selectedDraft.inputType)}>
-                {selectedDraft.inputType === "images" ? <Images size={18} /> : <Clapperboard size={18} />}
+              <button className="path-picker media-path" type="button" disabled={reshootBusy || !selectedDraft.reshootSource?.eligible || selectedDraft.running} onClick={() => void chooseReshootInput(selectedDraft.inputType)}>
                 <span>
                   <strong>{selectedDraft.inputPath ? basename(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImages") : t("input.selectVideo")}</strong>
                   <small>{selectedDraft.inputPath ? displayPath(selectedDraft.inputPath) : selectedDraft.inputType === "images" ? t("input.selectImagesHint") : t("input.selectVideoHint")}</small>
@@ -1794,14 +1937,14 @@ export function App() {
           </div>
 
           <div className="form-section">
-            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label><span className="locked-setting"><Lock size={12} />{t("reshoot.inheritedReadonly")}</span></div>
-            <div className="quality-settings locked-quality-settings">
+            <div className="field-label-row"><label className="field-label">{t("quality.label")}</label>{selectedReshootSourceProject?.taskKind !== "import" && <span className="locked-setting"><Lock size={12} />{t("reshoot.inheritedReadonly")}</span>}</div>
+            <div className={`quality-settings ${selectedReshootSourceProject?.taskKind === "import" ? "" : "locked-quality-settings"}`}>
               <div className="quality-list" role="radiogroup" aria-label={t("quality.label")}>
-                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"}>
+                {qualities.map((quality) => <button key={quality.value} type="button" role="radio" disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} aria-checked={selectedDraft.quality === quality.value} className={selectedDraft.quality === quality.value ? "quality-option selected" : "quality-option"} onClick={() => void chooseQuality(quality.value)}>
                   <span className="radio-mark"><span /></span><span><strong>{t(quality.label)}</strong><small>{t(quality.description)}</small></span>
                 </button>)}
               </div>
-              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.reshootSource?.plannerEnabled ?? false} disabled>
+              <button className="planner-switch" type="button" role="switch" aria-checked={selectedDraft.plannerEnabled} disabled={selectedReshootSourceProject?.taskKind !== "import" || selectedDraft.running} onClick={() => void changePlannerEnabled()}>
                 <span><strong>{t("planner.label")}</strong><small>{t("planner.hint")}</small></span>
                 <i aria-hidden="true"><span /></i>
               </button>
@@ -1832,7 +1975,7 @@ export function App() {
           {projectDetailLoading && !projectDetail ? <div className="task-detail-loading"><LoaderCircle className="spin" size={20} />{t("workspace.loadingTask")}</div> : selectedProject.status === "completed" ? <>
             <ProjectResultStats project={selectedProject} detail={projectDetail} />
             {projectConfigurationDetails}
-            {selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
+            {selectedProject.taskKind !== "import" && selectedProject.registeredRatio != null && selectedProject.registeredRatio < 0.8 && <p className="project-quality-warning" role="status"><CircleAlert size={13} />{t("result.lowRegistration", { value: (selectedProject.registeredRatio * 100).toFixed(1) })}</p>}
             {detailErrorBanner}
             {historicalTaskProgress}
           </> : projectDetail ? <div className="unfinished-task-detail">
@@ -1843,7 +1986,7 @@ export function App() {
           </div> : detailErrorBanner}
         </section>}
 
-        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.engine ?? "system", level: event.level, text: event.kind === "log" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
+        {!selectedSharedTask && selectedShowsLiveRun && <TaskProgress progressKey={store.liveTask ? `${store.liveTask.task_id}:${store.liveTask.run_id ?? 'pending'}` : progressEvent?.runId ? `${progressEvent.taskId}:${progressEvent.runId}` : `local:${runStartedAt.current}`} operationAttempt={progressEvent?.operation?.attempt} substage={progressEvent?.substage} status={store.phase} stage={progressEvent?.stage ?? null} progress={store.progress} stageProgress={activeStageProgress} message={currentMessage} elapsedMs={liveElapsedMs} remainingSeconds={trainingRemainingSeconds} runtime={store.latestRuntime} showRuntimePanel={uiPreferences.showRuntimePanel} logs={store.events.map((event, index) => ({ key: `${event.sequence}:${index}`, timestamp: event.timestamp, source: event.engine ?? "system", level: event.level, text: event.kind === "log" && event.engine !== "system" ? event.message : localizePipelineMessage(locale, event.message) }))} cancelling={isCancellationRequested} onCancel={() => void requestCancellation()} logRef={liveLogRef} onLogScroll={updateLiveLogFollow} />}
 
 
       </section>
@@ -1883,18 +2026,19 @@ export function App() {
           <div className="group-heading">
             <button className="group-toggle" type="button" aria-expanded={expandedGroups.new} aria-controls="new-task-group-content" aria-label={t(expandedGroups.new ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("workspace.newTasks") })} onClick={() => toggleTaskGroup("new")}><ChevronDown size={14} aria-hidden="true" /><span>{t("workspace.newTasks")}</span></button>
             <button className="group-add-action" type="button" onClick={addGenerationDraft}><Plus size={13} />{t("workspace.addTask")}</button>
-            <button className="queue-toggle" type="button" role="switch" aria-checked={autoRunNext} onClick={() => setAutoQueueEnabled(!autoRunNext)}><i aria-hidden="true"><span /></i><span>{t("workspace.autoRunNext")}</span></button>
+            <button className="queue-toggle" type="button" role="switch" aria-checked={autoRunNext} disabled={queueChecking || !!preflight} onClick={() => autoRunNext ? setAutoQueueEnabled(false) : void checkQueueInputs(true)}><i aria-hidden="true"><span /></i><span>{t("workspace.autoRunNext")}</span></button>
             <small className="group-count">{t("history.projects", { count: visibleDrafts.length + submittedNew.length })}</small>
           </div>
+          {queueInputNotice && <p className="queue-input-notice" role="status">{queueInputNotice}</p>}
           {taskSyncError && <p role="status">{taskSyncError}</p>}
           <div id="new-task-group-content" className="project-group-content" hidden={!expandedGroups.new}>{renderSharedNewRows()}{visibleDrafts.map((draft, index) => <DraftRow key={draft.id} draft={draft} status={displayStatusForDraft(draft, queuedDrafts)} insertion={draftDrag?.insertionIndex === drafts.findIndex(item => item.id === draft.id) ? "before" : draftDrag?.insertionIndex === drafts.findIndex(item => item.id === draft.id) + 1 && index === visibleDrafts.length - 1 ? "after" : null} dragging={draftDrag?.id === draft.id} selected={selectedTask.kind === "draft" && selectedTask.id === draft.id} onSelect={() => {
             if (suppressDraftSelectionRef.current !== draft.id) selectDraft(draft.id);
           }} onDelete={() => removeDraft(draft.id)} onPointerDown={(event) => beginDraftDrag(event, draft.id)} onPointerMove={updateDraftDrag} onPointerEnd={endDraftDrag} onKeyboardMove={(offset) => moveDraftWithKeyboard(draft.id, offset)} />)}</div>
           <span className="visually-hidden" aria-live="polite">{reorderAnnouncement}</span>
         </div>
-        <div className="project-group">
-          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span><small>{t("history.projects", { count: completed.length + submittedCompleted.length })}</small></button></div>
-          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{renderSharedRows(submittedCompleted)}{completed.map((project) => <ProjectRow key={project.id} project={project} selected={selectedTask.kind === "project" && selectedTask.id === project.id} busy={runBusy} previewing={openingPreviewProjectId === project.id} previewDisabled={openingPreviewProjectId !== null || closingPreviewProjectId === project.id} deleting={deletingProjectId === project.id} revealing={revealingProjectId === project.id} onSelect={selectProject} onPreview={(item) => void previewProject(item)} onReshoot={(item) => void openReshoot(item)} onResume={() => undefined} onReveal={(item) => void showProject(item)} onDelete={(item) => void removeProject(item)} />)}</div>
+        <div className="project-group completed-task-group">
+          <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.completed} aria-controls="completed-task-group-content" aria-label={t(expandedGroups.completed ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.completed") })} onClick={() => toggleTaskGroup("completed")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.completed")}</span></button><div className="completed-import-actions"><button className="group-add-action" type="button" disabled={runBusy} aria-haspopup="menu" aria-expanded={!runBusy && importMenuOpen} onClick={() => setImportMenuOpen(open => !open)}><Plus size={13} />{t("import.add")}</button>{!runBusy && importMenuOpen && <div className="completed-import-menu" role="menu"><button type="button" role="menuitem" onClick={() => void chooseGaussianImport("file")}><Upload size={14} />{t("import.file")}</button><button type="button" role="menuitem" onClick={() => void chooseGaussianImport("folder")}><FolderOpen size={14} />{t("import.folder")}</button></div>}</div><small className="group-count">{t("history.projects", { count: completed.length + submittedCompleted.length })}</small></div>
+          <div id="completed-task-group-content" className="project-group-content" hidden={!expandedGroups.completed}>{completedRows.map(item => item.kind === "task" ? renderSharedRow(item.task) : renderCompletedProjectRow(item.project))}</div>
         </div>
         <div className="project-group unfinished">
           <div className="group-heading"><button className="group-toggle" type="button" aria-expanded={expandedGroups.unfinished} aria-controls="unfinished-task-group-content" aria-label={t(expandedGroups.unfinished ? "workspace.collapseGroup" : "workspace.expandGroup", { group: t("history.unfinished") })} onClick={() => toggleTaskGroup("unfinished")}><ChevronDown size={14} aria-hidden="true" /><span>{t("history.unfinished")}</span><small>{t("history.projects", { count: unfinished.length + submittedUnfinished.length })}</small></button></div>
@@ -1924,6 +2068,8 @@ export function App() {
     {failureDialog && <FailureGuidanceDialog failure={failureDialog} action={failureDialogAction} onClose={closeFailureDialog} onRetry={() => void retryFailedProject()} onOpenLogs={() => void openFailureLogs()} />}
     {telemetryPreferences && !telemetryPreferences.consentDecided && <TelemetryPreferences mode="consent" preferences={telemetryPreferences} busy={telemetryBusy} onChange={(enabled) => void changeTelemetryConsent(enabled)} />}
     {settingsOpen && <SettingsDialog preferences={telemetryPreferences} telemetryBusy={telemetryBusy} showRuntimePanel={uiPreferences.showRuntimePanel} onTelemetryChange={(enabled) => void changeTelemetryConsent(enabled)} onRuntimePanelChange={changeRuntimePanelPreference} onClose={() => setSettingsOpen(false)} updatePanel={<UpdateSettingsRow result={updates.result} busy={updates.busy} failed={updates.failed} cooldownSeconds={updates.cooldownSeconds} onCheck={() => void checkUpdatesManually()} />} />}
-    {updates.dialogRequested && updates.release && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
+    {preflight && !settingsOpen && !failureDialog && !showCancellationOverlay && !gaussianImportSelectionId && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <GenerationPreflightDialog key={preflight.questions.map(item => item.snapshot).join('|')} session={preflight} onFinish={finishPreflight} />}
+    {updates.dialogRequested && updates.release && !preflight && !queueChecking && !settingsOpen && !failureDialog && !showCancellationOverlay && !(telemetryPreferences && !telemetryPreferences.consentDecided) && <UpdateNoticeDialog currentVersion={updates.result!.currentVersion} release={updates.release} onClose={updates.dismiss} />}
+    {gaussianImportSelectionId && <GaussianImportDialog selectionId={gaussianImportSelectionId} onClose={() => setGaussianImportSelectionId(null)} onImported={finishGaussianImport} />}
   </main>;
 }

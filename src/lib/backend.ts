@@ -4,7 +4,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
+import type { AppRuntimeStatus, AppSettings, ColmapAccelerationStatus, EngineStatus, GaussianCrop, GaussianEditSaveSession, GaussianEditState, GaussianExportProgress, GaussianExportResult, GaussianImportProbe, GaussianImportSelection, GaussianImportSession, GaussianPreviewDescriptor, GaussianTransform, GaussianVideoExportResult, GaussianVideoExportSession, InputType, PipelineEvent, PipelineResult, ProbeAndPlan, ProjectOverview, ProjectSummary, ProjectTaskDetail, Quality, ReshootInputInfo, ReshootSourceInfo, RuntimeEstimate } from "../types/pipeline";
 import type { TelemetryPreferences } from "../types/telemetry";
 import type { ErrorReportDraft, ErrorReportReceipt } from "../types/diagnostics";
 import { getCurrentLocale, translate } from "../i18n";
@@ -28,6 +28,17 @@ export async function selectImageSequence(): Promise<string | null> {
   const selected = await open({ title: translate(locale, "dialog.selectImagesTitle"), multiple: false, directory: true });
   return typeof selected === "string" ? selected : null;
 }
+
+export async function selectGaussianImportSource(kind: "file" | "folder"): Promise<GaussianImportSelection | null> { return inTauri() ? invoke("select_gaussian_import_source", { kind }) : null; }
+export async function probeGaussianImport(selectionId: string): Promise<GaussianImportProbe> { return invoke("probe_gaussian_import", { selectionId }); }
+export async function beginGaussianImport(request: { probeId: string; modelId: string; colmapId: string | null; projectName: string }): Promise<GaussianImportSession> { return invoke("begin_gaussian_import", { request }); }
+export async function readGaussianImportChunk(importId: string, filename: string, offset: number, length: number): Promise<ArrayBuffer | Uint8Array> {
+  return invoke("read_gaussian_import_chunk", undefined, { headers: { "x-ooosplat-import-id": importId, "x-ooosplat-import-file": filename, "x-ooosplat-offset": String(offset), "x-ooosplat-length": String(length) } });
+}
+export async function writeGaussianImportChunk(importId: string, offset: number, bytes: Uint8Array): Promise<number> { return invoke("write_gaussian_import_chunk", bytes, { headers: { "x-ooosplat-import-id": importId, "x-ooosplat-offset": String(offset) } }); }
+export async function completeGaussianImport(request: { importId: string; splatCount: number; shBands: number; model: string | null }): Promise<ProjectSummary> { return invoke("complete_gaussian_import", { request }); }
+export async function cancelGaussianImport(importId: string): Promise<void> { return invoke("cancel_gaussian_import", { importId }); }
+export async function relinkImportedProject(projectId: string, selectionId: string): Promise<ProjectSummary> { return invoke("relink_imported_project", { projectId, selectionId }); }
 
 
 export async function confirmLargeImageSequence(imageCount: number): Promise<boolean> {
@@ -73,7 +84,11 @@ export async function selectProjectsRoot(current: string): Promise<string | null
 
 export async function checkEngines(): Promise<EngineStatus[]> { return inTauri() ? invoke("check_engines") : []; }
 export async function checkColmapAcceleration(): Promise<ColmapAccelerationStatus | null> { return inTauri() ? invoke("check_colmap_acceleration") : null; }
-export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true): Promise<ProbeAndPlan> { return invoke("probe_and_plan", { path, quality, plannerEnabled }); }
+export async function probeAndPlan(path: string, quality: Quality, plannerEnabled = true, cached?: import("../types/pipeline").InputAnalysis | import("../types/pipeline").VideoAnalysis, onAnalyzed?: (value: import("../types/pipeline").InputAnalysis) => void): Promise<ProbeAndPlan> {
+  const analysis = cached ?? await invoke<import("../types/pipeline").InputAnalysis>("analyze_input", { path });
+  if ('inputType' in analysis) onAnalyzed?.(analysis);
+  return invoke("probe_and_plan", { path, quality, plannerEnabled, ...('inputType' in analysis ? { inputAnalysis: analysis } : { videoAnalysis: analysis }) });
+}
 export async function estimateProjectRuntime(projectId: string): Promise<RuntimeEstimate> { return invoke("estimate_project_runtime", { projectId }); }
 export async function getProjectOverview(): Promise<ProjectOverview> { return invoke("get_project_overview"); }
 export async function getProjectTaskDetail(projectId: string): Promise<ProjectTaskDetail> { return invoke("get_project_task_detail", { projectId }); }
@@ -104,8 +119,8 @@ export async function onInputDragDrop(handler: (event: NativeInputDragEvent) => 
     });
   });
 }
-export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string): Promise<PipelineResult> {
-  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId });
+export async function startPipeline(path: string, quality: Quality, projectsRoot: string, plannerEnabled = true, workspaceTaskId?: string, videoProjection?: import("../types/pipeline").VideoProjection, videoSourceIdentity?: string, imageMatchingStrategy?: import("../types/pipeline").ImageMatchingStrategy): Promise<PipelineResult> {
+  const task = await invoke<SharedTask>("create_gui_task", { path, quality, projectsRoot, plannerEnabled, workspaceTaskId, inputProjection: videoProjection, inputSourceIdentity: videoSourceIdentity, imageMatchingStrategy });
   await startGuiTask(task.task_id);
   return waitForSharedTask(task.task_id);
 }
@@ -115,7 +130,7 @@ export async function resumePipeline(projectId: string): Promise<PipelineResult>
 }
 export async function inspectReshootSource(projectId: string): Promise<ReshootSourceInfo> { return invoke("inspect_reshoot_source", { projectId }); }
 export async function probeReshootInput(projectId: string, path: string, inputType: InputType): Promise<ReshootInputInfo> { return invoke("probe_reshoot_input", { projectId, path, inputType }); }
-export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string }): Promise<PipelineResult> {
+export async function startReshootPipeline(request: { sourceProjectId: string; reshootPath: string; inputType: InputType; projectsRoot: string; workspaceTaskId?: string; quality?: Quality; plannerEnabled?: boolean }): Promise<PipelineResult> {
   const receipt = await invoke<StartReceipt>("start_gui_reshoot", { request });
   return waitForSharedTask(receipt.task_id);
 }
@@ -147,11 +162,14 @@ export async function prepareGaussianPreview(projectId: string): Promise<Gaussia
   }
   return {
     ...descriptor,
-    assetUrl: previewAssetUrl(convertFileSrc(descriptor.assetPath), "previewSession", crypto.randomUUID()),
+    assetUrl: descriptor.readToken ? `ooosplat-import-${descriptor.readToken}.ply` : previewAssetUrl(convertFileSrc(descriptor.assetPath), "previewSession", crypto.randomUUID()),
     editMaskAssetUrl: descriptor.editMaskAssetPath
       ? previewAssetUrl(convertFileSrc(descriptor.editMaskAssetPath), "editSession", crypto.randomUUID())
       : null,
   };
+}
+export async function readGaussianPreviewChunk(readToken: string, offset: number, length: number): Promise<ArrayBuffer | Uint8Array> {
+  return invoke("read_gaussian_preview_chunk", undefined, { headers: { "x-ooosplat-preview-token": readToken, "x-ooosplat-offset": String(offset), "x-ooosplat-length": String(length) } });
 }
 export async function releaseGaussianPreview(projectId: string): Promise<void> { return invoke("release_gaussian_preview", { projectId }); }
 export async function saveGaussianTransform(projectId: string, transform: GaussianTransform): Promise<GaussianTransform> { return invoke("save_gaussian_transform", { projectId, transform }); }
@@ -182,6 +200,7 @@ export async function revealProject(project: ProjectSummary): Promise<void> {
 }
 
 export async function revealProjectLogs(projectId: string): Promise<void> { await invoke("open_project_location", { projectId, location: "logs" }); }
+export async function revealImportedSource(projectId: string): Promise<void> { await invoke("open_project_location", { projectId, location: "source" }); }
 
 export async function revealFile(path: string): Promise<void> {
   await revealItemInDir(path);
@@ -231,7 +250,7 @@ async function waitForSharedTask(taskId: string): Promise<PipelineResult> {
         revision = task.revision;
         if (taskIsActive(task)) return;
         if (task.status === 'completed' && task.result) resolve(task.result);
-        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, failureId: task.error?.failure_id, projectId: task.project_id });
+        else reject({ code: task.status === 'cancelled' ? 'cancelled' : 'pipeline_failed', message: task.error?.message ?? task.status, failedStage: task.error?.failed_stage, engine: task.error?.engine, failureKind: task.error?.classification, classificationVersion: task.error?.classification_version, classificationIsHeuristic: task.error?.classification_is_heuristic, termination: task.error?.termination, failureId: task.error?.failure_id, projectId: task.project_id });
       };
       void (async () => {
         unsubscribe = await onTaskUpdate(update => apply(update.task));
