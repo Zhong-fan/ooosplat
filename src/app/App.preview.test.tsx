@@ -255,14 +255,20 @@ describe("App preview workspace", () => {
         detail: "Executable not found",
       }] });
     });
-    const details = container.querySelector<HTMLDetailsElement>(".engine-diagnostics")!;
-    expect(details.querySelector("summary")?.textContent).toContain("2 个引擎异常：FFPROBE · FFMPEG");
-    await act(async () => { details.querySelector("summary")!.click(); });
-    expect(details.open).toBe(true);
-    expect(details.textContent).toContain("FFPROBE");
+    const { checkEngines } = await import('../lib/backend');
+    const previousChecks = vi.mocked(checkEngines).mock.calls.length;
+    const details = container.querySelector<HTMLElement>(".engine-diagnostics")!;
+    const trigger = details.querySelector<HTMLButtonElement>(".engine-summary")!;
+    expect(trigger.textContent).toBe("2 个引擎异常");
+    expect(trigger.textContent).not.toMatch(/ffmpeg|ffprobe|colmap|brush/i);
+    expect(details.querySelector(".engine-diagnostics-panel")).toBeNull();
+    await act(async () => { trigger.focus(); });
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    expect(details.textContent).toContain("FFprobe");
     expect(details.textContent).toContain("E:\\engines\\ffprobe.exe");
-    expect(details.textContent).toContain("可启动: 否");
+    expect(details.querySelector('.engine-item-flags')?.textContent).toContain("可启动否");
     expect(details.textContent).toContain("Missing runtime dependency");
+    expect(vi.mocked(checkEngines).mock.calls.length).toBe(previousChecks);
   });
 
   it("shows the current package version and a start action without a trailing arrow", () => {
@@ -1260,7 +1266,7 @@ describe("App preview workspace", () => {
     expect(container.textContent).toContain("Create New Task");
     expect(container.textContent).toContain("Task List");
     expect(container.textContent).toContain("Start Generation");
-    expect(container.textContent).toContain("Checking bundled engines");
+    expect(container.textContent).toContain("Checking engines");
     expect(languageButton?.textContent).toContain("中文");
     expect(languageButton?.title).toBe("中英文切换 / Switch language");
     expect(window.localStorage.getItem("ooo-splat-language")).toBe("en");
